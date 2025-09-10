@@ -3,8 +3,6 @@ prefix: echidna_
 corpusDir: echidna-corpus
 cryticArgs:
   [
-    "--solc-version",
-    "0.8.9",
     "--solc-remaps",
     "@axelar-network/axelar-gmp-sdk-solidity/=node_modules/@axelar-network/axelar-gmp-sdk-solidity/",
   ]
