@@ -199,3 +199,22 @@ General Message Passing Usage: https://docs.axelar.dev/dev/gmp
 Example cross-chain token swap app: https://app.squidrouter.com
 
 EVM module of the Axelar network that prepares commands for the gateway: https://github.com/axelarnetwork/axelar-core/blob/main/x/evm/keeper/msg_server.go
+
+## Audit harnesses
+
+- Foundry setup provided in `foundry.toml` and `forge-tests/`.
+- Echidna harness and config provided in `contracts/echidna/` and `echidna.yaml`.
+
+Run Foundry tests:
+
+```bash
+forge test -v
+```
+
+Run Echidna (requires crytic/echidna):
+
+```bash
+echidna-test contracts/echidna/EchidnaGatewayCap.sol --contract EchidnaGatewayCap -c echidna.yaml
+```
+
+See `AUDIT_PLAN.md` for the strategy and `INVARIANTS.md` for properties.

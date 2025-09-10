@@ -8,11 +8,40 @@ import { IAxelarAuth } from '../interfaces/IAxelarAuth.sol';
 import { ECDSA } from '../ECDSA.sol';
 
 contract EchidnaAuthMock is IAxelarAuth {
+    address private _owner;
+    address private _pendingOwner;
+
+    constructor() {
+        _owner = msg.sender;
+    }
+
     function validateProof(bytes32, bytes calldata) external pure returns (bool) {
         return true;
     }
 
     function transferOperatorship(bytes calldata) external {}
+
+    // IOwnable minimal implementation
+    function owner() external view returns (address) {
+        return _owner;
+    }
+
+    function pendingOwner() external view returns (address) {
+        return _pendingOwner;
+    }
+
+    function proposeOwnership(address newOwner) external {
+        _pendingOwner = newOwner;
+    }
+
+    function transferOwnership(address newOwner) external {
+        _owner = newOwner;
+    }
+
+    function acceptOwnership() external {
+        _owner = _pendingOwner;
+        _pendingOwner = address(0);
+    }
 }
 
 contract EchidnaGatewayCap {
