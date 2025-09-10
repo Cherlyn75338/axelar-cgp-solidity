@@ -1,0 +1,2573 @@
+/workspace/contracts/AxelarGateway.sol
+   1 |     | // SPDX-License-Identifier: MIT
+   2 |     | 
+   3 |     | pragma solidity ^0.8.0;
+   4 |     | 
+   5 |     | import { IERC20 } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IERC20.sol';
+   6 |     | import { IImplementation } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IImplementation.sol';
+   7 |     | import { IContractIdentifier } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IContractIdentifier.sol';
+   8 |     | import { SafeTokenCall, SafeTokenTransfer, SafeTokenTransferFrom } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/libs/SafeTransfer.sol';
+   9 |     | import { ContractAddress } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/libs/ContractAddress.sol';
+  10 |     | import { Implementation } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/upgradable/Implementation.sol';
+  11 |     | 
+  12 |     | import { IAxelarAuth } from './interfaces/IAxelarAuth.sol';
+  13 |     | import { IBurnableMintableCappedERC20 } from './interfaces/IBurnableMintableCappedERC20.sol';
+  14 |     | import { ITokenDeployer } from './interfaces/ITokenDeployer.sol';
+  15 |     | import { IAxelarConsensusGateway } from './interfaces/IAxelarConsensusGateway.sol';
+  16 |     | 
+  17 |     | import { ECDSA } from './ECDSA.sol';
+  18 |     | import { DepositHandler } from './DepositHandler.sol';
+  19 |     | import { EternalStorage } from './EternalStorage.sol';
+  20 |     | 
+  21 |     | /**
+  22 |     |  * @title AxelarGateway Contract
+  23 |     |  * @notice This contract serves as the gateway for cross-chain contract calls,
+  24 |     |  * and token transfers within the Axelar network.
+  25 |     |  * It includes functions for sending tokens, calling contracts, and validating contract calls.
+  26 |     |  * The contract is managed via the decentralized governance mechanism on the Axelar network.
+  27 |     |  * @dev EternalStorage is used to simplify storage for upgradability, and InterchainGovernance module is used for governance.
+  28 |     |  */
+  29 | *   | contract AxelarGateway is IAxelarConsensusGateway, Implementation, EternalStorage {
+  30 |     |     using SafeTokenCall for IERC20;
+  31 |     |     using SafeTokenTransfer for IERC20;
+  32 |     |     using SafeTokenTransferFrom for IERC20;
+  33 |     |     using ContractAddress for address;
+  34 |     | 
+  35 |     |     error InvalidImplementation();
+  36 |     | 
+  37 |     |     enum TokenType {
+  38 |     |         InternalBurnable,
+  39 |     |         InternalBurnableFrom,
+  40 |     |         External
+  41 |     |     }
+  42 |     | 
+  43 |     |     /**
+  44 |     |      * @dev Deprecated slots. Should not be reused.
+  45 |     |      */
+  46 |     |     // bytes32 internal constant KEY_ALL_TOKENS_FROZEN = keccak256('all-tokens-frozen');
+  47 |     |     // bytes32 internal constant PREFIX_TOKEN_FROZEN = keccak256('token-frozen');
+  48 |     | 
+  49 |     |     /**
+  50 |     |      * @dev Storage slot with the address of the current implementation. `keccak256('eip1967.proxy.implementation') - 1`.
+  51 |     |      */
+  52 |     |     bytes32 internal constant KEY_IMPLEMENTATION = bytes32(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc);
+  53 |     | 
+  54 |     |     /**
+  55 |     |      * @dev Storage slot with the address of the current governance. keccak256('governance')) - 1
+  56 |     |      */
+  57 |     |     bytes32 internal constant KEY_GOVERNANCE = bytes32(0xabea6fd3db56a6e6d0242111b43ebb13d1c42709651c032c7894962023a1f909);
+  58 |     | 
+  59 |     |     /**
+  60 |     |      * @dev Storage slot with the address of the current mint limiter. keccak256('mint-limiter')) - 1
+  61 |     |      */
+  62 |     |     bytes32 internal constant KEY_MINT_LIMITER = bytes32(0x627f0c11732837b3240a2de89c0b6343512886dd50978b99c76a68c6416a4d92);
+  63 |     | 
+  64 | *   |     bytes32 internal constant PREFIX_COMMAND_EXECUTED = keccak256('command-executed');
+  65 | *   |     bytes32 internal constant PREFIX_TOKEN_ADDRESS = keccak256('token-address');
+  66 | *   |     bytes32 internal constant PREFIX_TOKEN_TYPE = keccak256('token-type');
+  67 |     |     bytes32 internal constant PREFIX_CONTRACT_CALL_APPROVED = keccak256('contract-call-approved');
+  68 |     |     bytes32 internal constant PREFIX_CONTRACT_CALL_APPROVED_WITH_MINT = keccak256('contract-call-approved-with-mint');
+  69 | *   |     bytes32 internal constant PREFIX_TOKEN_MINT_LIMIT = keccak256('token-mint-limit');
+  70 | *   |     bytes32 internal constant PREFIX_TOKEN_MINT_AMOUNT = keccak256('token-mint-amount');
+  71 |     | 
+  72 |     |     bytes32 internal constant SELECTOR_BURN_TOKEN = keccak256('burnToken');
+  73 | *   |     bytes32 internal constant SELECTOR_DEPLOY_TOKEN = keccak256('deployToken');
+  74 | *   |     bytes32 internal constant SELECTOR_MINT_TOKEN = keccak256('mintToken');
+  75 |     |     bytes32 internal constant SELECTOR_APPROVE_CONTRACT_CALL = keccak256('approveContractCall');
+  76 |     |     bytes32 internal constant SELECTOR_APPROVE_CONTRACT_CALL_WITH_MINT = keccak256('approveContractCallWithMint');
+  77 |     |     bytes32 internal constant SELECTOR_TRANSFER_OPERATORSHIP = keccak256('transferOperatorship');
+  78 |     | 
+  79 |     |     address public immutable authModule;
+  80 |     |     address public immutable tokenDeployer;
+  81 |     | 
+  82 |     |     /**
+  83 |     |      * @notice Constructs the AxelarGateway contract.
+  84 |     |      * @param authModule_ The address of the authentication module
+  85 |     |      * @param tokenDeployer_ The address of the token deployer
+  86 |     |      */
+  87 | *   |     constructor(address authModule_, address tokenDeployer_) {
+  88 | *   |         if (authModule_.code.length == 0) revert InvalidAuthModule();
+  89 | *   |         if (tokenDeployer_.code.length == 0) revert InvalidTokenDeployer();
+  90 |     | 
+  91 | *   |         authModule = authModule_;
+  92 | *   |         tokenDeployer = tokenDeployer_;
+  93 |     |     }
+  94 |     | 
+  95 |     |     /**
+  96 |     |      * @notice Ensures that the caller of the function is the gateway contract itself.
+  97 |     |      */
+  98 |     |     modifier onlySelf() {
+  99 | *   |         if (msg.sender != address(this)) revert NotSelf();
+ 100 |     | 
+ 101 | *   |         _;
+ 102 |     |     }
+ 103 |     | 
+ 104 |     |     /**
+ 105 |     |      * @notice Ensures that the caller of the function is the governance address.
+ 106 |     |      */
+ 107 |     |     modifier onlyGovernance() {
+ 108 |     |         if (msg.sender != getAddress(KEY_GOVERNANCE)) revert NotGovernance();
+ 109 |     | 
+ 110 |     |         _;
+ 111 |     |     }
+ 112 |     | 
+ 113 |     |     /**
+ 114 |     |      * @notice Ensures that the caller of the function is either the mint limiter or governance.
+ 115 |     |      */
+ 116 |     |     modifier onlyMintLimiter() {
+ 117 |     |         if (msg.sender != getAddress(KEY_MINT_LIMITER) && msg.sender != getAddress(KEY_GOVERNANCE)) revert NotMintLimiter();
+ 118 |     | 
+ 119 |     |         _;
+ 120 |     |     }
+ 121 |     | 
+ 122 |     |     /******************\
+ 123 |     |     |* Public Methods *|
+ 124 |     |     \******************/
+ 125 |     | 
+ 126 |     |     /**
+ 127 |     |      * @notice Send the specified token to the destination chain and address.
+ 128 |     |      * @param destinationChain The chain to send tokens to. A registered chain name on Axelar must be used here
+ 129 |     |      * @param destinationAddress The address on the destination chain to send tokens to
+ 130 |     |      * @param symbol The symbol of the token to send
+ 131 |     |      * @param amount The amount of tokens to send
+ 132 |     |      */
+ 133 |     |     function sendToken(
+ 134 |     |         string calldata destinationChain,
+ 135 |     |         string calldata destinationAddress,
+ 136 |     |         string calldata symbol,
+ 137 |     |         uint256 amount
+ 138 |     |     ) external {
+ 139 |     |         _burnTokenFrom(msg.sender, symbol, amount);
+ 140 |     |         emit TokenSent(msg.sender, destinationChain, destinationAddress, symbol, amount);
+ 141 |     |     }
+ 142 |     | 
+ 143 |     |     /**
+ 144 |     |      * @notice Calls a contract on the specified destination chain with a given payload.
+ 145 |     |      * This function is the entry point for general message passing between chains.
+ 146 |     |      * @param destinationChain The chain where the destination contract exists. A registered chain name on Axelar must be used here
+ 147 |     |      * @param destinationContractAddress The address of the contract to call on the destination chain
+ 148 |     |      * @param payload The payload to be sent to the destination contract, usually representing an encoded function call with arguments
+ 149 |     |      */
+ 150 |     |     function callContract(
+ 151 |     |         string calldata destinationChain,
+ 152 |     |         string calldata destinationContractAddress,
+ 153 |     |         bytes calldata payload
+ 154 |     |     ) external {
+ 155 |     |         emit ContractCall(msg.sender, destinationChain, destinationContractAddress, keccak256(payload), payload);
+ 156 |     |     }
+ 157 |     | 
+ 158 |     |     /**
+ 159 |     |      * @notice Calls a contract on the specified destination chain with a given payload and token amount.
+ 160 |     |      * This function is the entry point for general message passing with token transfer between chains.
+ 161 |     |      * @param destinationChain The chain where the destination contract exists. A registered chain name on Axelar must be used here
+ 162 |     |      * @param destinationContractAddress The address of the contract to call with tokens on the destination chain
+ 163 |     |      * @param payload The payload to be sent to the destination contract, usually representing an encoded function call with arguments
+ 164 |     |      * @param symbol The symbol of the token to be sent with the call
+ 165 |     |      * @param amount The amount of tokens to be sent with the call
+ 166 |     |      */
+ 167 |     |     function callContractWithToken(
+ 168 |     |         string calldata destinationChain,
+ 169 |     |         string calldata destinationContractAddress,
+ 170 |     |         bytes calldata payload,
+ 171 |     |         string calldata symbol,
+ 172 |     |         uint256 amount
+ 173 |     |     ) external {
+ 174 |     |         _burnTokenFrom(msg.sender, symbol, amount);
+ 175 |     |         emit ContractCallWithToken(msg.sender, destinationChain, destinationContractAddress, keccak256(payload), payload, symbol, amount);
+ 176 |     |     }
+ 177 |     | 
+ 178 |     |     /**
+ 179 |     |      * @notice Checks whether a contract call has been approved by the gateway.
+ 180 |     |      * @param commandId The gateway command ID
+ 181 |     |      * @param sourceChain The source chain of the contract call
+ 182 |     |      * @param sourceAddress The source address of the contract call
+ 183 |     |      * @param contractAddress The contract address that will be called
+ 184 |     |      * @param payloadHash The hash of the payload for that will be sent with the call
+ 185 |     |      * @return bool A boolean value indicating whether the contract call has been approved by the gateway.
+ 186 |     |      */
+ 187 |     |     function isContractCallApproved(
+ 188 |     |         bytes32 commandId,
+ 189 |     |         string calldata sourceChain,
+ 190 |     |         string calldata sourceAddress,
+ 191 |     |         address contractAddress,
+ 192 |     |         bytes32 payloadHash
+ 193 |     |     ) external view override returns (bool) {
+ 194 |     |         return getBool(_getIsContractCallApprovedKey(commandId, sourceChain, sourceAddress, contractAddress, payloadHash));
+ 195 |     |     }
+ 196 |     | 
+ 197 |     |     /**
+ 198 |     |      * @notice Checks whether a contract call with token has been approved by the gateway.
+ 199 |     |      * @param commandId The gateway command ID
+ 200 |     |      * @param sourceChain The source chain of the contract call
+ 201 |     |      * @param sourceAddress The source address of the contract call
+ 202 |     |      * @param contractAddress The contract address that will be called, and where tokens will be sent
+ 203 |     |      * @param payloadHash The hash of the payload for that will be sent with the call
+ 204 |     |      * @param symbol The symbol of the token to be sent with the call
+ 205 |     |      * @param amount The amount of tokens to be sent with the call
+ 206 |     |      * @return bool A boolean value indicating whether the contract call with token has been approved by the gateway.
+ 207 |     |      */
+ 208 |     |     function isContractCallAndMintApproved(
+ 209 |     |         bytes32 commandId,
+ 210 |     |         string calldata sourceChain,
+ 211 |     |         string calldata sourceAddress,
+ 212 |     |         address contractAddress,
+ 213 |     |         bytes32 payloadHash,
+ 214 |     |         string calldata symbol,
+ 215 |     |         uint256 amount
+ 216 |     |     ) external view override returns (bool) {
+ 217 |     |         return
+ 218 |     |             getBool(
+ 219 |     |                 _getIsContractCallApprovedWithMintKey(commandId, sourceChain, sourceAddress, contractAddress, payloadHash, symbol, amount)
+ 220 |     |             );
+ 221 |     |     }
+ 222 |     | 
+ 223 |     |     /**
+ 224 |     |      * @notice Called on the destination chain gateway by the recipient of the cross-chain contract call to validate it and only allow execution
+ 225 |     |      * if this function returns true.
+ 226 |     |      * @dev Once validated, the gateway marks the message as executed so the contract call is not executed twice.
+ 227 |     |      * @param commandId The gateway command ID
+ 228 |     |      * @param sourceChain The source chain of the contract call
+ 229 |     |      * @param sourceAddress The source address of the contract call
+ 230 |     |      * @param payloadHash The hash of the payload for that will be sent with the call
+ 231 |     |      * @return valid True if the contract call is approved, false otherwise
+ 232 |     |      */
+ 233 | *   |     function validateContractCall(
+ 234 |     |         bytes32 commandId,
+ 235 |     |         string calldata sourceChain,
+ 236 |     |         string calldata sourceAddress,
+ 237 |     |         bytes32 payloadHash
+ 238 | *   |     ) external override returns (bool valid) {
+ 239 |     |         bytes32 key = _getIsContractCallApprovedKey(commandId, sourceChain, sourceAddress, msg.sender, payloadHash);
+ 240 |     |         valid = getBool(key);
+ 241 | *   |         if (valid) {
+ 242 |     |             _setBool(key, false);
+ 243 |     | 
+ 244 |     |             emit ContractCallExecuted(commandId);
+ 245 |     |         }
+ 246 |     |     }
+ 247 |     | 
+ 248 |     |     /**
+ 249 |     |      * @notice Called on the destination chain gateway to validate the approval of a contract call with token transfer and only
+ 250 |     |      * allow execution if this function returns true.
+ 251 |     |      * @dev Once validated, the gateway marks the message as executed so the contract call with token is not executed twice.
+ 252 |     |      * @param commandId The gateway command ID
+ 253 |     |      * @param sourceChain The source chain of the contract call
+ 254 |     |      * @param sourceAddress The source address of the contract call
+ 255 |     |      * @param payloadHash The hash of the payload for that will be sent with the call
+ 256 |     |      * @param symbol The symbol of the token to be sent with the call
+ 257 |     |      * @param amount The amount of tokens to be sent with the call
+ 258 |     |      * @return valid True if the contract call with token is approved, false otherwise
+ 259 |     |      */
+ 260 | *   |     function validateContractCallAndMint(
+ 261 |     |         bytes32 commandId,
+ 262 |     |         string calldata sourceChain,
+ 263 |     |         string calldata sourceAddress,
+ 264 |     |         bytes32 payloadHash,
+ 265 |     |         string calldata symbol,
+ 266 |     |         uint256 amount
+ 267 |     |     ) external override returns (bool valid) {
+ 268 |     |         bytes32 key = _getIsContractCallApprovedWithMintKey(commandId, sourceChain, sourceAddress, msg.sender, payloadHash, symbol, amount);
+ 269 |     |         valid = getBool(key);
+ 270 |     |         if (valid) {
+ 271 |     |             // Prevent re-entrancy
+ 272 |     |             _setBool(key, false);
+ 273 |     | 
+ 274 |     |             emit ContractCallExecuted(commandId);
+ 275 |     | 
+ 276 |     |             _mintToken(symbol, msg.sender, amount);
+ 277 |     |         }
+ 278 |     |     }
+ 279 |     | 
+ 280 |     |     /***********\
+ 281 |     |     |* Getters *|
+ 282 |     |     \***********/
+ 283 |     | 
+ 284 |     |     /**
+ 285 |     |      * @notice Gets the address of governance, should be the address of InterchainGovernance.
+ 286 |     |      * @return address The address of governance.
+ 287 |     |      */
+ 288 |     |     function governance() public view override returns (address) {
+ 289 |     |         return getAddress(KEY_GOVERNANCE);
+ 290 |     |     }
+ 291 |     | 
+ 292 |     |     /**
+ 293 |     |      * @notice Gets the address of the mint limiter, should be the address of Multisig.
+ 294 |     |      * @return address The address of the mint limiter.
+ 295 |     |      */
+ 296 |     |     function mintLimiter() public view override returns (address) {
+ 297 |     |         return getAddress(KEY_MINT_LIMITER);
+ 298 |     |     }
+ 299 |     | 
+ 300 |     |     /**
+ 301 |     |      * @notice Gets the transfer limit for a specific token symbol within the configured epoch.
+ 302 |     |      * @param symbol The symbol of the token
+ 303 |     |      * @return uint The transfer limit for the given token.
+ 304 |     |      */
+ 305 | *   |     function tokenMintLimit(string memory symbol) public view override returns (uint256) {
+ 306 | *   |         return getUint(_getTokenMintLimitKey(symbol));
+ 307 |     |     }
+ 308 |     | 
+ 309 |     |     /**
+ 310 |     |      * @notice Gets the transfer amount for a specific token symbol within the configured epoch.
+ 311 |     |      * @param symbol The symbol of the token
+ 312 |     |      * @return uint The transfer amount for the given token.
+ 313 |     |      */
+ 314 | *   |     function tokenMintAmount(string memory symbol) public view override returns (uint256) {
+ 315 | *   |         return getUint(_getTokenMintAmountKey(symbol, block.timestamp / 6 hours));
+ 316 |     |     }
+ 317 |     | 
+ 318 |     |     /**
+ 319 |     |      * @dev This function is kept around to keep things working for internal
+ 320 |     |      * tokens that were deployed before the token freeze functionality was removed
+ 321 |     |      */
+ 322 |     |     function allTokensFrozen() external pure override returns (bool) {
+ 323 |     |         return false;
+ 324 |     |     }
+ 325 |     | 
+ 326 |     |     /**
+ 327 |     |      * @notice Gets the address of the gateway implementation contract.
+ 328 |     |      * @return address The address of the gateway implementation.
+ 329 |     |      */
+ 330 |     |     function implementation() public view override returns (address) {
+ 331 |     |         return getAddress(KEY_IMPLEMENTATION);
+ 332 |     |     }
+ 333 |     | 
+ 334 |     |     /**
+ 335 |     |      * @notice Gets the address of a specific token using its symbol.
+ 336 |     |      * @param symbol The symbol of the token
+ 337 |     |      * @return address The address of the token associated with the given symbol.
+ 338 |     |      */
+ 339 | *   |     function tokenAddresses(string memory symbol) public view override returns (address) {
+ 340 | *   |         return getAddress(_getTokenAddressKey(symbol));
+ 341 |     |     }
+ 342 |     | 
+ 343 |     |     /**
+ 344 |     |      * @dev Deprecated. This function is kept around to keep things working for internal tokens that were deployed before the token freeze functionality was removed
+ 345 |     |      */
+ 346 |     |     function tokenFrozen(string memory) external pure override returns (bool) {
+ 347 |     |         return false;
+ 348 |     |     }
+ 349 |     | 
+ 350 |     |     /**
+ 351 |     |      * @notice Checks whether a command with a given command ID has been executed.
+ 352 |     |      * @param commandId The command ID to check
+ 353 |     |      * @return bool True if the command has been executed, false otherwise
+ 354 |     |      */
+ 355 | *   |     function isCommandExecuted(bytes32 commandId) public view override returns (bool) {
+ 356 | *   |         return getBool(_getIsCommandExecutedKey(commandId));
+ 357 |     |     }
+ 358 |     | 
+ 359 |     |     /**
+ 360 |     |      * @notice Gets the contract ID of the Axelar Gateway.
+ 361 |     |      * @return bytes32 The keccak256 hash of the string 'axelar-gateway'
+ 362 |     |      */
+ 363 |     |     function contractId() public pure returns (bytes32) {
+ 364 |     |         return keccak256('axelar-gateway');
+ 365 |     |     }
+ 366 |     | 
+ 367 |     |     /************************\
+ 368 |     |     |* Governance Functions *|
+ 369 |     |     \************************/
+ 370 |     | 
+ 371 |     |     /**
+ 372 |     |      * @notice Transfers the governance role to a new address.
+ 373 |     |      * @param newGovernance The address to transfer the governance role to.
+ 374 |     |      * @dev Only the current governance entity can call this function.
+ 375 |     |      */
+ 376 |     |     function transferGovernance(address newGovernance) external override onlyGovernance {
+ 377 |     |         if (newGovernance == address(0)) revert InvalidGovernance();
+ 378 |     | 
+ 379 |     |         _transferGovernance(newGovernance);
+ 380 |     |     }
+ 381 |     | 
+ 382 |     |     /**
+ 383 |     |      * @notice Transfers the mint limiter role to a new address.
+ 384 |     |      * @param newMintLimiter The address to transfer the mint limiter role to.
+ 385 |     |      * @dev Only the current mint limiter or the governance address can call this function.
+ 386 |     |      */
+ 387 | *   |     function transferMintLimiter(address newMintLimiter) external override onlyMintLimiter {
+ 388 |     |         if (newMintLimiter == address(0)) revert InvalidMintLimiter();
+ 389 |     | 
+ 390 | *   |         _transferMintLimiter(newMintLimiter);
+ 391 |     |     }
+ 392 |     | 
+ 393 |     |     /**
+ 394 |     |      * @notice Sets the transfer limits for an array of tokens.
+ 395 |     |      * @param symbols The array of token symbols to set the transfer limits for
+ 396 |     |      * @param limits The array of transfer limits corresponding to the symbols
+ 397 |     |      * @dev Only the mint limiter or the governance address can call this function.
+ 398 |     |      */
+ 399 |     |     function setTokenMintLimits(string[] calldata symbols, uint256[] calldata limits) external override onlyMintLimiter {
+ 400 |     |         uint256 length = symbols.length;
+ 401 |     |         if (length != limits.length) revert InvalidSetMintLimitsParams();
+ 402 |     | 
+ 403 |     |         for (uint256 i; i < length; ++i) {
+ 404 |     |             string memory symbol = symbols[i];
+ 405 |     |             uint256 limit = limits[i];
+ 406 |     | 
+ 407 |     |             if (tokenAddresses(symbol) == address(0)) revert TokenDoesNotExist(symbol);
+ 408 |     | 
+ 409 |     |             _setTokenMintLimit(symbol, limit);
+ 410 |     |         }
+ 411 |     |     }
+ 412 |     | 
+ 413 |     |     /**
+ 414 |     |      * @notice Upgrades the contract to a new implementation.
+ 415 |     |      * @param newImplementation The address of the new implementation
+ 416 |     |      * @param newImplementationCodeHash The code hash of the new implementation
+ 417 |     |      * @param setupParams Optional setup params for the new implementation
+ 418 |     |      * @dev Only the governance address can call this function.
+ 419 |     |      */
+ 420 | *   |     function upgrade(
+ 421 |     |         address newImplementation,
+ 422 |     |         bytes32 newImplementationCodeHash,
+ 423 |     |         bytes calldata setupParams
+ 424 |     |     ) external override onlyGovernance {
+ 425 |     |         if (newImplementationCodeHash != newImplementation.codehash) revert InvalidCodeHash();
+ 426 |     | 
+ 427 |     |         if (contractId() != IContractIdentifier(newImplementation).contractId()) revert InvalidImplementation();
+ 428 |     | 
+ 429 |     |         emit Upgraded(newImplementation);
+ 430 |     | 
+ 431 |     |         _setImplementation(newImplementation);
+ 432 |     | 
+ 433 | *   |         if (setupParams.length != 0) {
+ 434 |     |             // slither-disable-next-line controlled-delegatecall
+ 435 |     |             (bool success, ) = newImplementation.delegatecall(abi.encodeWithSelector(IImplementation.setup.selector, setupParams));
+ 436 |     | 
+ 437 |     |             if (!success) revert SetupFailed();
+ 438 |     |         }
+ 439 |     |     }
+ 440 |     | 
+ 441 |     |     /**********************\
+ 442 |     |     |* External Functions *|
+ 443 |     |     \**********************/
+ 444 |     | 
+ 445 |     |     /**
+ 446 |     |      * @notice Sets up the governance and mint limiter roles, and transfers operatorship if necessary.
+ 447 |     |      * This function is called by the proxy during initial deployment, and optionally called during gateway upgrades.
+ 448 |     |      * @param params The encoded parameters containing the governance and mint limiter addresses, as well as the new operator data.
+ 449 |     |      * @dev Not publicly accessible as it's overshadowed in the proxy.
+ 450 |     |      */
+ 451 |     |     function setup(bytes calldata params) external override(IImplementation, Implementation) onlyProxy {
+ 452 |     |         (address governance_, address mintLimiter_, bytes memory newOperatorsData) = abi.decode(params, (address, address, bytes));
+ 453 |     | 
+ 454 |     |         if (governance_ != address(0)) _transferGovernance(governance_);
+ 455 |     |         if (mintLimiter_ != address(0)) _transferMintLimiter(mintLimiter_);
+ 456 |     | 
+ 457 |     |         if (newOperatorsData.length != 0) {
+ 458 |     |             emit OperatorshipTransferred(newOperatorsData);
+ 459 |     | 
+ 460 |     |             IAxelarAuth(authModule).transferOperatorship(newOperatorsData);
+ 461 |     |         }
+ 462 |     |     }
+ 463 |     | 
+ 464 |     |     /**
+ 465 |     |      * @notice Executes a batch of commands signed by the Axelar network. There are a finite set of command types that can be executed.
+ 466 |     |      * @param input The encoded input containing the data for the batch of commands, as well as the proof that verifies the integrity of the data.
+ 467 |     |      * @dev Each command has a corresponding commandID that is guaranteed to be unique from the Axelar network.
+ 468 |     |      * @dev This function allows retrying a commandID if the command initially failed to be processed.
+ 469 |     |      * @dev Ignores unknown commands or duplicate commandIDs.
+ 470 |     |      * @dev Emits an Executed event for successfully executed commands.
+ 471 |     |      */
+ 472 |     |     // slither-disable-next-line cyclomatic-complexity
+ 473 | *   |     function execute(bytes calldata input) external override {
+ 474 | *   |         (bytes memory data, bytes memory proof) = abi.decode(input, (bytes, bytes));
+ 475 |     | 
+ 476 | *   |         bytes32 messageHash = ECDSA.toEthSignedMessageHash(keccak256(data));
+ 477 |     | 
+ 478 |     |         // returns true for current operators
+ 479 |     |         // slither-disable-next-line reentrancy-no-eth
+ 480 | *   |         bool allowOperatorshipTransfer = IAxelarAuth(authModule).validateProof(messageHash, proof);
+ 481 |     | 
+ 482 | *   |         uint256 chainId;
+ 483 | *   |         bytes32[] memory commandIds;
+ 484 | *   |         string[] memory commands;
+ 485 | *   |         bytes[] memory params;
+ 486 |     | 
+ 487 | *   |         (chainId, commandIds, commands, params) = abi.decode(data, (uint256, bytes32[], string[], bytes[]));
+ 488 |     | 
+ 489 | *   |         if (chainId != block.chainid) revert InvalidChainId();
+ 490 |     | 
+ 491 | *   |         uint256 commandsLength = commandIds.length;
+ 492 |     | 
+ 493 | *   |         if (commandsLength != commands.length || commandsLength != params.length) revert InvalidCommands();
+ 494 |     | 
+ 495 | *   |         for (uint256 i; i < commandsLength; ++i) {
+ 496 | *   |             bytes32 commandId = commandIds[i];
+ 497 |     | 
+ 498 |     |             // Ignore if duplicate commandId received
+ 499 | *   |             if (isCommandExecuted(commandId)) continue;
+ 500 |     | 
+ 501 | *   |             bytes4 commandSelector;
+ 502 | *   |             bytes32 commandHash = keccak256(abi.encodePacked(commands[i]));
+ 503 |     | 
+ 504 | *   |             if (commandHash == SELECTOR_DEPLOY_TOKEN) {
+ 505 | *   |                 commandSelector = AxelarGateway.deployToken.selector;
+ 506 | *   |             } else if (commandHash == SELECTOR_MINT_TOKEN) {
+ 507 | *   |                 commandSelector = AxelarGateway.mintToken.selector;
+ 508 |     |             } else if (commandHash == SELECTOR_APPROVE_CONTRACT_CALL) {
+ 509 |     |                 commandSelector = AxelarGateway.approveContractCall.selector;
+ 510 |     |             } else if (commandHash == SELECTOR_APPROVE_CONTRACT_CALL_WITH_MINT) {
+ 511 |     |                 commandSelector = AxelarGateway.approveContractCallWithMint.selector;
+ 512 |     |             } else if (commandHash == SELECTOR_BURN_TOKEN) {
+ 513 |     |                 commandSelector = AxelarGateway.burnToken.selector;
+ 514 | *   |             } else if (commandHash == SELECTOR_TRANSFER_OPERATORSHIP) {
+ 515 |     |                 if (!allowOperatorshipTransfer) continue;
+ 516 |     | 
+ 517 |     |                 allowOperatorshipTransfer = false;
+ 518 |     |                 commandSelector = AxelarGateway.transferOperatorship.selector;
+ 519 |     |             } else {
+ 520 |     |                 // Ignore unknown commands
+ 521 |     |                 continue;
+ 522 |     |             }
+ 523 |     | 
+ 524 |     |             // Prevent a re-entrancy from executing this command before it can be marked as successful.
+ 525 | *   |             _setCommandExecuted(commandId, true);
+ 526 |     | 
+ 527 |     |             // slither-disable-next-line calls-loop,reentrancy-no-eth
+ 528 | *   |             (bool success, ) = address(this).call(abi.encodeWithSelector(commandSelector, params[i], commandId));
+ 529 |     | 
+ 530 |     |             // slither-disable-next-line reentrancy-events
+ 531 | *   |             if (success) emit Executed(commandId);
+ 532 | *   |             else _setCommandExecuted(commandId, false);
+ 533 |     |         }
+ 534 |     |     }
+ 535 |     | 
+ 536 |     |     /******************\
+ 537 |     |     |* Self Functions *|
+ 538 |     |     \******************/
+ 539 |     | 
+ 540 |     |     /**
+ 541 |     |      * @notice Deploys a new token or registers an existing token in the gateway contract itself.
+ 542 |     |      * @param params Encoded parameters including the token name, symbol, decimals, cap, token address, and mint limit
+ 543 |     |      * @dev If the token address is not specified, a new token is deployed and registed as InternalBurnableFrom
+ 544 |     |      * @dev If the token address is specified, the token is marked as External.
+ 545 |     |      * @dev Emits a TokenDeployed event with the symbol and token address.
+ 546 |     |      */
+ 547 | *   |     function deployToken(bytes calldata params, bytes32) external onlySelf {
+ 548 | *   |         (string memory name, string memory symbol, uint8 decimals, uint256 cap, address tokenAddress, uint256 mintLimit) = abi.decode(
+ 549 | *   |             params,
+ 550 |     |             (string, string, uint8, uint256, address, uint256)
+ 551 |     |         );
+ 552 |     | 
+ 553 |     |         // Ensure that this symbol has not been taken.
+ 554 | *   |         if (tokenAddresses(symbol) != address(0)) revert TokenAlreadyExists(symbol);
+ 555 |     | 
+ 556 | *   |         _setTokenMintLimit(symbol, mintLimit);
+ 557 |     | 
+ 558 | *   |         if (tokenAddress == address(0)) {
+ 559 |     |             // If token address is not specified, it indicates a request to deploy one.
+ 560 | *   |             bytes32 salt = keccak256(abi.encodePacked(symbol));
+ 561 |     | 
+ 562 | *   |             _setTokenType(symbol, TokenType.InternalBurnableFrom);
+ 563 |     | 
+ 564 |     |             // slither-disable-next-line reentrancy-no-eth,controlled-delegatecall
+ 565 | *   |             (bool success, bytes memory data) = tokenDeployer.delegatecall(
+ 566 | *   |                 abi.encodeWithSelector(ITokenDeployer.deployToken.selector, name, symbol, decimals, cap, salt)
+ 567 |     |             );
+ 568 |     | 
+ 569 | *   |             if (!success) revert TokenDeployFailed(symbol);
+ 570 |     | 
+ 571 | *   |             tokenAddress = abi.decode(data, (address));
+ 572 |     |         } else {
+ 573 |     |             // If token address is specified, ensure that there is a contact at the specified address.
+ 574 |     |             if (tokenAddress.code.length == uint256(0)) revert TokenContractDoesNotExist(tokenAddress);
+ 575 |     | 
+ 576 |     |             // Mark that this symbol is an external token, which is needed to differentiate between operations on mint and burn.
+ 577 | *   |             _setTokenType(symbol, TokenType.External);
+ 578 |     |         }
+ 579 |     | 
+ 580 |     |         // slither-disable-next-line reentrancy-events
+ 581 | *   |         emit TokenDeployed(symbol, tokenAddress);
+ 582 |     | 
+ 583 | *   |         _setTokenAddress(symbol, tokenAddress);
+ 584 |     |     }
+ 585 |     | 
+ 586 |     |     /**
+ 587 |     |      * @notice Transfers a specific amount of tokens to an account, based on the provided symbol.
+ 588 |     |      * @param params Encoded parameters including the token symbol, recipient address, and amount to mint.
+ 589 |     |      * @dev This function will revert if the token is not registered with the gatewaty.
+ 590 |     |      * @dev If the token type is External, a safe transfer is performed to the recipient account.
+ 591 |     |      * @dev If the token type is Internal (InternalBurnable or InternalBurnableFrom), the mint function is called on the token address.
+ 592 |     |      */
+ 593 | *   |     function mintToken(bytes calldata params, bytes32) external onlySelf {
+ 594 | *   |         (string memory symbol, address account, uint256 amount) = abi.decode(params, (string, address, uint256));
+ 595 |     | 
+ 596 | *   |         _mintToken(symbol, account, amount);
+ 597 |     |     }
+ 598 |     | 
+ 599 |     |     /**
+ 600 |     |      * @notice Burns tokens of a given symbol, either through an external deposit handler or a token defined burn method.
+ 601 |     |      * @param params Encoded parameters including the token symbol and a salt value for the deposit handler
+ 602 |     |      */
+ 603 | *   |     function burnToken(bytes calldata params, bytes32) external onlySelf {
+ 604 |     |         (string memory symbol, bytes32 salt) = abi.decode(params, (string, bytes32));
+ 605 |     | 
+ 606 |     |         address tokenAddress = tokenAddresses(symbol);
+ 607 |     | 
+ 608 |     |         if (tokenAddress == address(0)) revert TokenDoesNotExist(symbol);
+ 609 |     | 
+ 610 |     |         if (_getTokenType(symbol) == TokenType.External) {
+ 611 |     |             address depositHandlerAddress = _getCreate2Address(salt, keccak256(abi.encodePacked(type(DepositHandler).creationCode)));
+ 612 |     | 
+ 613 |     |             if (depositHandlerAddress.isContract()) return;
+ 614 |     | 
+ 615 |     |             DepositHandler depositHandler = new DepositHandler{ salt: salt }();
+ 616 |     | 
+ 617 |     |             (bool success, bytes memory returnData) = depositHandler.execute(
+ 618 |     |                 tokenAddress,
+ 619 |     |                 abi.encodeWithSelector(IERC20.transfer.selector, address(this), IERC20(tokenAddress).balanceOf(address(depositHandler)))
+ 620 |     |             );
+ 621 |     | 
+ 622 |     |             if (!success || (returnData.length != uint256(0) && !abi.decode(returnData, (bool)))) revert BurnFailed(symbol);
+ 623 |     | 
+ 624 |     |             // NOTE: `depositHandler` must always be destroyed in the same runtime context that it is deployed.
+ 625 |     |             depositHandler.destroy(address(this));
+ 626 |     |         } else {
+ 627 |     |             IBurnableMintableCappedERC20(tokenAddress).burn(salt);
+ 628 |     |         }
+ 629 |     |     }
+ 630 |     | 
+ 631 |     |     /**
+ 632 |     |      * @notice Approves a contract call.
+ 633 |     |      * @param params Encoded parameters including the source chain, source address, contract address, payload hash, transaction hash, and event index
+ 634 |     |      * @param commandId to associate with the approval
+ 635 |     |      */
+ 636 |     |     function approveContractCall(bytes calldata params, bytes32 commandId) external onlySelf {
+ 637 |     |         (
+ 638 |     |             string memory sourceChain,
+ 639 |     |             string memory sourceAddress,
+ 640 |     |             address contractAddress,
+ 641 |     |             bytes32 payloadHash,
+ 642 |     |             bytes32 sourceTxHash,
+ 643 |     |             uint256 sourceEventIndex
+ 644 |     |         ) = abi.decode(params, (string, string, address, bytes32, bytes32, uint256));
+ 645 |     | 
+ 646 |     |         _setContractCallApproved(commandId, sourceChain, sourceAddress, contractAddress, payloadHash);
+ 647 |     |         emit ContractCallApproved(commandId, sourceChain, sourceAddress, contractAddress, payloadHash, sourceTxHash, sourceEventIndex);
+ 648 |     |     }
+ 649 |     | 
+ 650 |     |     /**
+ 651 |     |      * @notice Approves a contract call with token transfer.
+ 652 |     |      * @param params Encoded parameters including the source chain, source address, contract address, payload hash, token symbol,
+ 653 |     |      * token amount, transaction hash, and event index.
+ 654 |     |      * @param commandId to associate with the approval
+ 655 |     |      */
+ 656 |     |     function approveContractCallWithMint(bytes calldata params, bytes32 commandId) external onlySelf {
+ 657 |     |         (
+ 658 |     |             string memory sourceChain,
+ 659 |     |             string memory sourceAddress,
+ 660 |     |             address contractAddress,
+ 661 |     |             bytes32 payloadHash,
+ 662 |     |             string memory symbol,
+ 663 |     |             uint256 amount,
+ 664 |     |             bytes32 sourceTxHash,
+ 665 |     |             uint256 sourceEventIndex
+ 666 |     |         ) = abi.decode(params, (string, string, address, bytes32, string, uint256, bytes32, uint256));
+ 667 |     | 
+ 668 |     |         _setContractCallApprovedWithMint(commandId, sourceChain, sourceAddress, contractAddress, payloadHash, symbol, amount);
+ 669 |     |         emit ContractCallApprovedWithMint(
+ 670 |     |             commandId,
+ 671 |     |             sourceChain,
+ 672 |     |             sourceAddress,
+ 673 |     |             contractAddress,
+ 674 |     |             payloadHash,
+ 675 |     |             symbol,
+ 676 |     |             amount,
+ 677 |     |             sourceTxHash,
+ 678 |     |             sourceEventIndex
+ 679 |     |         );
+ 680 |     |     }
+ 681 |     | 
+ 682 |     |     /**
+ 683 |     |      * @notice Transfers operatorship with the provided data by calling the transferOperatorship function on the auth module.
+ 684 |     |      * @param newOperatorsData Encoded data for the new operators
+ 685 |     |      */
+ 686 |     |     function transferOperatorship(bytes calldata newOperatorsData, bytes32) external onlySelf {
+ 687 |     |         emit OperatorshipTransferred(newOperatorsData);
+ 688 |     | 
+ 689 |     |         IAxelarAuth(authModule).transferOperatorship(newOperatorsData);
+ 690 |     |     }
+ 691 |     | 
+ 692 |     |     /********************\
+ 693 |     |     |* Internal Methods *|
+ 694 |     |     \********************/
+ 695 |     | 
+ 696 | *   |     function _mintToken(
+ 697 |     |         string memory symbol,
+ 698 |     |         address account,
+ 699 |     |         uint256 amount
+ 700 | *   |     ) internal {
+ 701 | *   |         address tokenAddress = tokenAddresses(symbol);
+ 702 |     | 
+ 703 | *   |         if (tokenAddress == address(0)) revert TokenDoesNotExist(symbol);
+ 704 |     | 
+ 705 | *   |         _setTokenMintAmount(symbol, tokenMintAmount(symbol) + amount);
+ 706 |     | 
+ 707 | *   |         if (_getTokenType(symbol) == TokenType.External) {
+ 708 |     |             IERC20(tokenAddress).safeTransfer(account, amount);
+ 709 |     |         } else {
+ 710 | *   |             IBurnableMintableCappedERC20(tokenAddress).mint(account, amount);
+ 711 |     |         }
+ 712 |     |     }
+ 713 |     | 
+ 714 |     |     /**
+ 715 |     |      * @notice Burns or locks a specific amount of tokens from a sender's account based on the provided symbol.
+ 716 |     |      * @param sender Address of the account from which to burn the tokens
+ 717 |     |      * @param symbol Symbol of the token to burn
+ 718 |     |      * @param amount Amount of tokens to burn
+ 719 |     |      * @dev Depending on the token type (External, InternalBurnableFrom, or InternalBurnable), the function either
+ 720 |     |      * transfers the tokens to gateway contract itself or calls a burn function on the token contract.
+ 721 |     |      */
+ 722 |     |     function _burnTokenFrom(
+ 723 |     |         address sender,
+ 724 |     |         string memory symbol,
+ 725 |     |         uint256 amount
+ 726 |     |     ) internal {
+ 727 |     |         address tokenAddress = tokenAddresses(symbol);
+ 728 |     | 
+ 729 |     |         if (tokenAddress == address(0)) revert TokenDoesNotExist(symbol);
+ 730 |     |         if (amount == 0) revert InvalidAmount();
+ 731 |     | 
+ 732 |     |         TokenType tokenType = _getTokenType(symbol);
+ 733 |     | 
+ 734 |     |         if (tokenType == TokenType.External) {
+ 735 |     |             IERC20(tokenAddress).safeTransferFrom(sender, address(this), amount);
+ 736 |     |         } else if (tokenType == TokenType.InternalBurnableFrom) {
+ 737 |     |             IERC20(tokenAddress).safeCall(abi.encodeWithSelector(IBurnableMintableCappedERC20.burnFrom.selector, sender, amount));
+ 738 |     |         } else {
+ 739 |     |             IERC20(tokenAddress).safeTransferFrom(sender, IBurnableMintableCappedERC20(tokenAddress).depositAddress(bytes32(0)), amount);
+ 740 |     |             IBurnableMintableCappedERC20(tokenAddress).burn(bytes32(0));
+ 741 |     |         }
+ 742 |     |     }
+ 743 |     | 
+ 744 |     |     /********************\
+ 745 |     |     |* Pure Key Getters *|
+ 746 |     |     \********************/
+ 747 |     | 
+ 748 | *   |     function _getTokenMintLimitKey(string memory symbol) internal pure returns (bytes32) {
+ 749 | *   |         return keccak256(abi.encodePacked(PREFIX_TOKEN_MINT_LIMIT, symbol));
+ 750 |     |     }
+ 751 |     | 
+ 752 | *   |     function _getTokenMintAmountKey(string memory symbol, uint256 day) internal pure returns (bytes32) {
+ 753 | *   |         return keccak256(abi.encode(PREFIX_TOKEN_MINT_AMOUNT, symbol, day));
+ 754 |     |     }
+ 755 |     | 
+ 756 | *   |     function _getTokenTypeKey(string memory symbol) internal pure returns (bytes32) {
+ 757 | *   |         return keccak256(abi.encodePacked(PREFIX_TOKEN_TYPE, symbol));
+ 758 |     |     }
+ 759 |     | 
+ 760 | *   |     function _getTokenAddressKey(string memory symbol) internal pure returns (bytes32) {
+ 761 | *   |         return keccak256(abi.encodePacked(PREFIX_TOKEN_ADDRESS, symbol));
+ 762 |     |     }
+ 763 |     | 
+ 764 | *   |     function _getIsCommandExecutedKey(bytes32 commandId) internal pure returns (bytes32) {
+ 765 | *   |         return keccak256(abi.encodePacked(PREFIX_COMMAND_EXECUTED, commandId));
+ 766 |     |     }
+ 767 |     | 
+ 768 |     |     function _getIsContractCallApprovedKey(
+ 769 |     |         bytes32 commandId,
+ 770 |     |         string memory sourceChain,
+ 771 |     |         string memory sourceAddress,
+ 772 |     |         address contractAddress,
+ 773 |     |         bytes32 payloadHash
+ 774 |     |     ) internal pure returns (bytes32) {
+ 775 |     |         return keccak256(abi.encode(PREFIX_CONTRACT_CALL_APPROVED, commandId, sourceChain, sourceAddress, contractAddress, payloadHash));
+ 776 |     |     }
+ 777 |     | 
+ 778 |     |     function _getIsContractCallApprovedWithMintKey(
+ 779 |     |         bytes32 commandId,
+ 780 |     |         string memory sourceChain,
+ 781 |     |         string memory sourceAddress,
+ 782 |     |         address contractAddress,
+ 783 |     |         bytes32 payloadHash,
+ 784 |     |         string memory symbol,
+ 785 |     |         uint256 amount
+ 786 |     |     ) internal pure returns (bytes32) {
+ 787 |     |         return
+ 788 |     |             keccak256(
+ 789 |     |                 abi.encode(
+ 790 |     |                     PREFIX_CONTRACT_CALL_APPROVED_WITH_MINT,
+ 791 |     |                     commandId,
+ 792 |     |                     sourceChain,
+ 793 |     |                     sourceAddress,
+ 794 |     |                     contractAddress,
+ 795 |     |                     payloadHash,
+ 796 |     |                     symbol,
+ 797 |     |                     amount
+ 798 |     |                 )
+ 799 |     |             );
+ 800 |     |     }
+ 801 |     | 
+ 802 |     |     /********************\
+ 803 |     |     |* Internal Getters *|
+ 804 |     |     \********************/
+ 805 |     | 
+ 806 |     |     function _getCreate2Address(bytes32 salt, bytes32 codeHash) internal view returns (address) {
+ 807 |     |         return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, codeHash)))));
+ 808 |     |     }
+ 809 |     | 
+ 810 | *   |     function _getTokenType(string memory symbol) internal view returns (TokenType) {
+ 811 | *   |         return TokenType(getUint(_getTokenTypeKey(symbol)));
+ 812 |     |     }
+ 813 |     | 
+ 814 |     |     /********************\
+ 815 |     |     |* Internal Setters *|
+ 816 |     |     \********************/
+ 817 |     | 
+ 818 | *   |     function _setTokenMintLimit(string memory symbol, uint256 limit) internal {
+ 819 | *   |         emit TokenMintLimitUpdated(symbol, limit);
+ 820 |     | 
+ 821 | *   |         _setUint(_getTokenMintLimitKey(symbol), limit);
+ 822 |     |     }
+ 823 |     | 
+ 824 | *   |     function _setTokenMintAmount(string memory symbol, uint256 amount) internal {
+ 825 | *   |         uint256 limit = tokenMintLimit(symbol);
+ 826 | *   |         if (limit > 0 && amount > limit) revert ExceedMintLimit(symbol);
+ 827 |     | 
+ 828 | *   |         _setUint(_getTokenMintAmountKey(symbol, block.timestamp / 6 hours), amount);
+ 829 |     |     }
+ 830 |     | 
+ 831 | *   |     function _setTokenType(string memory symbol, TokenType tokenType) internal {
+ 832 | *   |         _setUint(_getTokenTypeKey(symbol), uint256(tokenType));
+ 833 |     |     }
+ 834 |     | 
+ 835 | *   |     function _setTokenAddress(string memory symbol, address tokenAddress) internal {
+ 836 | *   |         _setAddress(_getTokenAddressKey(symbol), tokenAddress);
+ 837 |     |     }
+ 838 |     | 
+ 839 | *   |     function _setCommandExecuted(bytes32 commandId, bool executed) internal {
+ 840 | *   |         _setBool(_getIsCommandExecutedKey(commandId), executed);
+ 841 |     |     }
+ 842 |     | 
+ 843 |     |     function _setContractCallApproved(
+ 844 |     |         bytes32 commandId,
+ 845 |     |         string memory sourceChain,
+ 846 |     |         string memory sourceAddress,
+ 847 |     |         address contractAddress,
+ 848 |     |         bytes32 payloadHash
+ 849 |     |     ) internal {
+ 850 |     |         _setBool(_getIsContractCallApprovedKey(commandId, sourceChain, sourceAddress, contractAddress, payloadHash), true);
+ 851 |     |     }
+ 852 |     | 
+ 853 |     |     function _setContractCallApprovedWithMint(
+ 854 |     |         bytes32 commandId,
+ 855 |     |         string memory sourceChain,
+ 856 |     |         string memory sourceAddress,
+ 857 |     |         address contractAddress,
+ 858 |     |         bytes32 payloadHash,
+ 859 |     |         string memory symbol,
+ 860 |     |         uint256 amount
+ 861 |     |     ) internal {
+ 862 |     |         _setBool(
+ 863 |     |             _getIsContractCallApprovedWithMintKey(commandId, sourceChain, sourceAddress, contractAddress, payloadHash, symbol, amount),
+ 864 |     |             true
+ 865 |     |         );
+ 866 |     |     }
+ 867 |     | 
+ 868 |     |     function _setImplementation(address newImplementation) internal {
+ 869 |     |         _setAddress(KEY_IMPLEMENTATION, newImplementation);
+ 870 |     |     }
+ 871 |     | 
+ 872 |     |     function _transferGovernance(address newGovernance) internal {
+ 873 |     |         emit GovernanceTransferred(getAddress(KEY_GOVERNANCE), newGovernance);
+ 874 |     | 
+ 875 |     |         _setAddress(KEY_GOVERNANCE, newGovernance);
+ 876 |     |     }
+ 877 |     | 
+ 878 |     |     function _transferMintLimiter(address newMintLimiter) internal {
+ 879 |     |         emit MintLimiterTransferred(getAddress(KEY_MINT_LIMITER), newMintLimiter);
+ 880 |     | 
+ 881 |     |         _setAddress(KEY_MINT_LIMITER, newMintLimiter);
+ 882 |     |     }
+ 883 |     | }
+ 884 |     | 
+
+/workspace/contracts/BurnableMintableCappedERC20.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | import { IAxelarGateway } from './interfaces/IAxelarGateway.sol';
+  6 |     | import { IBurnableMintableCappedERC20 } from './interfaces/IBurnableMintableCappedERC20.sol';
+  7 |     | 
+  8 |     | import { MintableCappedERC20 } from './MintableCappedERC20.sol';
+  9 |     | import { DepositHandler } from './DepositHandler.sol';
+ 10 |     | 
+ 11 | *   | contract BurnableMintableCappedERC20 is IBurnableMintableCappedERC20, MintableCappedERC20 {
+ 12 | *   |     constructor(
+ 13 |     |         string memory name,
+ 14 |     |         string memory symbol,
+ 15 |     |         uint8 decimals,
+ 16 |     |         uint256 capacity
+ 17 | *   |     ) MintableCappedERC20(name, symbol, decimals, capacity) {}
+ 18 |     | 
+ 19 |     |     function depositAddress(bytes32 salt) public view returns (address) {
+ 20 |     |         /* Convert a hash which is bytes32 to an address which is 20-byte long
+ 21 |     |         according to https://docs.soliditylang.org/en/v0.8.1/control-structures.html?highlight=create2#salted-contract-creations-create2 */
+ 22 |     |         return
+ 23 |     |             address(
+ 24 |     |                 uint160(
+ 25 |     |                     uint256(
+ 26 |     |                         keccak256(
+ 27 |     |                             abi.encodePacked(bytes1(0xff), owner, salt, keccak256(abi.encodePacked(type(DepositHandler).creationCode)))
+ 28 |     |                         )
+ 29 |     |                     )
+ 30 |     |                 )
+ 31 |     |             );
+ 32 |     |     }
+ 33 |     | 
+ 34 | *   |     function burn(bytes32 salt) external onlyOwner {
+ 35 |     |         address account = depositAddress(salt);
+ 36 |     |         _burn(account, balanceOf[account]);
+ 37 |     |     }
+ 38 |     | 
+ 39 |     |     function burnFrom(address account, uint256 amount) external onlyOwner {
+ 40 |     |         uint256 _allowance = allowance[account][msg.sender];
+ 41 |     |         if (_allowance != type(uint256).max) {
+ 42 |     |             _approve(account, msg.sender, _allowance - amount);
+ 43 |     |         }
+ 44 |     |         _burn(account, amount);
+ 45 |     |     }
+ 46 |     | }
+ 47 |     | 
+
+/workspace/contracts/DepositHandler.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | contract DepositHandler {
+  6 |     |     error IsLocked();
+  7 |     |     error NotContract();
+  8 |     | 
+  9 |     |     uint256 internal constant IS_NOT_LOCKED = uint256(1);
+ 10 |     |     uint256 internal constant IS_LOCKED = uint256(2);
+ 11 |     | 
+ 12 |     |     uint256 internal _lockedStatus = IS_NOT_LOCKED;
+ 13 |     | 
+ 14 |     |     modifier noReenter() {
+ 15 |     |         if (_lockedStatus == IS_LOCKED) revert IsLocked();
+ 16 |     | 
+ 17 |     |         _lockedStatus = IS_LOCKED;
+ 18 |     |         _;
+ 19 |     |         _lockedStatus = IS_NOT_LOCKED;
+ 20 |     |     }
+ 21 |     | 
+ 22 |     |     function execute(address callee, bytes calldata data) external noReenter returns (bool success, bytes memory returnData) {
+ 23 |     |         if (callee.code.length == 0) revert NotContract();
+ 24 |     |         (success, returnData) = callee.call(data);
+ 25 |     |     }
+ 26 |     | 
+ 27 |     |     // NOTE: The gateway should always destroy the `DepositHandler` in the same runtime context that deploys it.
+ 28 |     |     function destroy(address etherDestination) external noReenter {
+ 29 |     |         selfdestruct(payable(etherDestination));
+ 30 |     |     }
+ 31 |     | }
+ 32 |     | 
+
+/workspace/contracts/ECDSA.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | /**
+  6 |     |  * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.
+  7 |     |  *
+  8 |     |  * These functions can be used to verify that a message was signed by the holder
+  9 |     |  * of the private keys of a given address.
+ 10 |     |  */
+ 11 |     | library ECDSA {
+ 12 |     |     error InvalidSignatureLength();
+ 13 |     |     error InvalidS();
+ 14 |     |     error InvalidV();
+ 15 |     |     error InvalidSignature();
+ 16 |     | 
+ 17 |     |     /**
+ 18 |     |      * @dev Returns the address that signed a hashed message (`hash`) with
+ 19 |     |      * `signature`. This address can then be used for verification purposes.
+ 20 |     |      *
+ 21 |     |      * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+ 22 |     |      * this function rejects them by requiring the `s` value to be in the lower
+ 23 |     |      * half order, and the `v` value to be either 27 or 28.
+ 24 |     |      *
+ 25 |     |      * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+ 26 |     |      * verification to be secure: it is possible to craft signatures that
+ 27 |     |      * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+ 28 |     |      * this is by receiving a hash of the original message (which may otherwise
+ 29 |     |      * be too long), and then calling {toEthSignedMessageHash} on it.
+ 30 |     |      */
+ 31 |     |     function recover(bytes32 hash, bytes memory signature) internal pure returns (address signer) {
+ 32 |     |         // Check the signature length
+ 33 |     |         if (signature.length != 65) revert InvalidSignatureLength();
+ 34 |     | 
+ 35 |     |         // Divide the signature in r, s and v variables
+ 36 |     |         bytes32 r;
+ 37 |     |         bytes32 s;
+ 38 |     |         uint8 v;
+ 39 |     | 
+ 40 |     |         // ecrecover takes the signature parameters, and the only way to get them
+ 41 |     |         // currently is to use assembly.
+ 42 |     |         // solhint-disable-next-line no-inline-assembly
+ 43 |     |         assembly {
+ 44 |     |             r := mload(add(signature, 0x20))
+ 45 |     |             s := mload(add(signature, 0x40))
+ 46 |     |             v := byte(0, mload(add(signature, 0x60)))
+ 47 |     |         }
+ 48 |     | 
+ 49 |     |         // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature
+ 50 |     |         // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines
+ 51 |     |         // the valid range for s in (281): 0 < s < secp256k1n ÷ 2 + 1, and for v in (282): v ∈ {27, 28}. Most
+ 52 |     |         // signatures from current libraries generate a unique signature with an s-value in the lower half order.
+ 53 |     |         //
+ 54 |     |         // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+ 55 |     |         // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+ 56 |     |         // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept
+ 57 |     |         // these malleable signatures as well.
+ 58 |     |         if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) revert InvalidS();
+ 59 |     | 
+ 60 |     |         if (v != 27 && v != 28) revert InvalidV();
+ 61 |     | 
+ 62 |     |         // If the signature is valid (and not malleable), return the signer address
+ 63 |     |         if ((signer = ecrecover(hash, v, r, s)) == address(0)) revert InvalidSignature();
+ 64 |     |     }
+ 65 |     | 
+ 66 |     |     /**
+ 67 |     |      * @dev Returns an Ethereum Signed Message, created from a `hash`. This
+ 68 |     |      * replicates the behavior of the
+ 69 |     |      * https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_sign[`eth_sign`]
+ 70 |     |      * JSON-RPC method.
+ 71 |     |      *
+ 72 |     |      * See {recover}.
+ 73 |     |      */
+ 74 | *   |     function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {
+ 75 |     |         // 32 is the length in bytes of hash,
+ 76 |     |         // enforced by the type signature above
+ 77 | *   |         return keccak256(abi.encodePacked('\x19Ethereum Signed Message:\n32', hash));
+ 78 |     |     }
+ 79 |     | }
+ 80 |     | 
+
+/workspace/contracts/ERC20.sol
+   1 |     | // SPDX-License-Identifier: MIT
+   2 |     | 
+   3 |     | pragma solidity 0.8.9;
+   4 |     | 
+   5 |     | import { IERC20 } from './interfaces/IERC20.sol';
+   6 |     | 
+   7 |     | /**
+   8 |     |  * @dev Implementation of the {IERC20} interface.
+   9 |     |  *
+  10 |     |  * This implementation is agnostic to the way tokens are created. This means
+  11 |     |  * that a supply mechanism has to be added in a derived contract using {_mint}.
+  12 |     |  * For a generic mechanism see {ERC20PresetMinterPauser}.
+  13 |     |  *
+  14 |     |  * TIP: For a detailed writeup see our guide
+  15 |     |  * https://forum.zeppelin.solutions/t/how-to-implement-erc20-supply-mechanisms/226[How
+  16 |     |  * to implement supply mechanisms].
+  17 |     |  *
+  18 |     |  * We have followed general OpenZeppelin guidelines: functions revert instead
+  19 |     |  * of returning `false` on failure. This behavior is nonetheless conventional
+  20 |     |  * and does not conflict with the expectations of ERC20 applications.
+  21 |     |  *
+  22 |     |  * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+  23 |     |  * This allows applications to reconstruct the allowance for all accounts just
+  24 |     |  * by listening to said events. Other implementations of the EIP may not emit
+  25 |     |  * these events, as it isn't required by the specification.
+  26 |     |  *
+  27 |     |  * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+  28 |     |  * functions have been added to mitigate the well-known issues around setting
+  29 |     |  * allowances. See {IERC20-approve}.
+  30 |     |  */
+  31 |     | contract ERC20 is IERC20 {
+  32 |     |     mapping(address => uint256) public override balanceOf;
+  33 |     | 
+  34 |     |     mapping(address => mapping(address => uint256)) public override allowance;
+  35 |     | 
+  36 |     |     uint256 public override totalSupply;
+  37 |     | 
+  38 |     |     string public name;
+  39 |     |     string public symbol;
+  40 |     | 
+  41 |     |     uint8 public immutable decimals;
+  42 |     | 
+  43 |     |     /**
+  44 |     |      * @dev Sets the values for {name}, {symbol}, and {decimals}.
+  45 |     |      */
+  46 |     |     constructor(
+  47 |     |         string memory name_,
+  48 |     |         string memory symbol_,
+  49 |     |         uint8 decimals_
+  50 |     |     ) {
+  51 | *   |         name = name_;
+  52 | *   |         symbol = symbol_;
+  53 | *   |         decimals = decimals_;
+  54 |     |     }
+  55 |     | 
+  56 |     |     /**
+  57 |     |      * @dev See {IERC20-transfer}.
+  58 |     |      *
+  59 |     |      * Requirements:
+  60 |     |      *
+  61 |     |      * - `recipient` cannot be the zero address.
+  62 |     |      * - the caller must have a balance of at least `amount`.
+  63 |     |      */
+  64 |     |     function transfer(address recipient, uint256 amount) external virtual override returns (bool) {
+  65 |     |         _transfer(msg.sender, recipient, amount);
+  66 |     |         return true;
+  67 |     |     }
+  68 |     | 
+  69 |     |     /**
+  70 |     |      * @dev See {IERC20-approve}.
+  71 |     |      *
+  72 |     |      * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+  73 |     |      * `transferFrom`. This is semantically equivalent to an infinite approval.
+  74 |     |      *
+  75 |     |      * Requirements:
+  76 |     |      *
+  77 |     |      * - `spender` cannot be the zero address.
+  78 |     |      */
+  79 |     |     function approve(address spender, uint256 amount) external virtual override returns (bool) {
+  80 |     |         _approve(msg.sender, spender, amount);
+  81 |     |         return true;
+  82 |     |     }
+  83 |     | 
+  84 |     |     /**
+  85 |     |      * @dev See {IERC20-transferFrom}.
+  86 |     |      *
+  87 |     |      * Emits an {Approval} event indicating the updated allowance. This is not
+  88 |     |      * required by the EIP. See the note at the beginning of {ERC20}.
+  89 |     |      *
+  90 |     |      * Requirements:
+  91 |     |      *
+  92 |     |      * - `sender` and `recipient` cannot be the zero address.
+  93 |     |      * - `sender` must have a balance of at least `amount`.
+  94 |     |      * - the caller must have allowance for ``sender``'s tokens of at least
+  95 |     |      * `amount`.
+  96 |     |      */
+  97 |     |     function transferFrom(
+  98 |     |         address sender,
+  99 |     |         address recipient,
+ 100 |     |         uint256 amount
+ 101 |     |     ) external virtual override returns (bool) {
+ 102 |     |         uint256 _allowance = allowance[sender][msg.sender];
+ 103 |     | 
+ 104 |     |         if (_allowance != type(uint256).max) {
+ 105 |     |             _approve(sender, msg.sender, _allowance - amount);
+ 106 |     |         }
+ 107 |     | 
+ 108 |     |         _transfer(sender, recipient, amount);
+ 109 |     | 
+ 110 |     |         return true;
+ 111 |     |     }
+ 112 |     | 
+ 113 |     |     /**
+ 114 |     |      * @dev Atomically increases the allowance granted to `spender` by the caller.
+ 115 |     |      *
+ 116 |     |      * This is an alternative to {approve} that can be used as a mitigation for
+ 117 |     |      * problems described in {IERC20-approve}.
+ 118 |     |      *
+ 119 |     |      * Emits an {Approval} event indicating the updated allowance.
+ 120 |     |      *
+ 121 |     |      * Requirements:
+ 122 |     |      *
+ 123 |     |      * - `spender` cannot be the zero address.
+ 124 |     |      */
+ 125 |     |     function increaseAllowance(address spender, uint256 addedValue) external virtual returns (bool) {
+ 126 |     |         _approve(msg.sender, spender, allowance[msg.sender][spender] + addedValue);
+ 127 |     |         return true;
+ 128 |     |     }
+ 129 |     | 
+ 130 |     |     /**
+ 131 |     |      * @dev Atomically decreases the allowance granted to `spender` by the caller.
+ 132 |     |      *
+ 133 |     |      * This is an alternative to {approve} that can be used as a mitigation for
+ 134 |     |      * problems described in {IERC20-approve}.
+ 135 |     |      *
+ 136 |     |      * Emits an {Approval} event indicating the updated allowance.
+ 137 |     |      *
+ 138 |     |      * Requirements:
+ 139 |     |      *
+ 140 |     |      * - `spender` cannot be the zero address.
+ 141 |     |      * - `spender` must have allowance for the caller of at least
+ 142 |     |      * `subtractedValue`.
+ 143 |     |      */
+ 144 |     |     function decreaseAllowance(address spender, uint256 subtractedValue) external virtual returns (bool) {
+ 145 |     |         _approve(msg.sender, spender, allowance[msg.sender][spender] - subtractedValue);
+ 146 |     |         return true;
+ 147 |     |     }
+ 148 |     | 
+ 149 |     |     /**
+ 150 |     |      * @dev Moves tokens `amount` from `sender` to `recipient`.
+ 151 |     |      *
+ 152 |     |      * This is internal function is equivalent to {transfer}, and can be used to
+ 153 |     |      * e.g. implement automatic token fees, slashing mechanisms, etc.
+ 154 |     |      *
+ 155 |     |      * Emits a {Transfer} event.
+ 156 |     |      *
+ 157 |     |      * Requirements:
+ 158 |     |      *
+ 159 |     |      * - `sender` cannot be the zero address.
+ 160 |     |      * - `recipient` cannot be the zero address.
+ 161 |     |      * - `sender` must have a balance of at least `amount`.
+ 162 |     |      */
+ 163 |     |     function _transfer(
+ 164 |     |         address sender,
+ 165 |     |         address recipient,
+ 166 |     |         uint256 amount
+ 167 |     |     ) internal virtual {
+ 168 |     |         if (sender == address(0) || recipient == address(0)) revert InvalidAccount();
+ 169 |     | 
+ 170 |     |         balanceOf[sender] -= amount;
+ 171 |     |         balanceOf[recipient] += amount;
+ 172 |     |         emit Transfer(sender, recipient, amount);
+ 173 |     |     }
+ 174 |     | 
+ 175 |     |     /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+ 176 |     |      * the total supply.
+ 177 |     |      *
+ 178 |     |      * Emits a {Transfer} event with `from` set to the zero address.
+ 179 |     |      *
+ 180 |     |      * Requirements:
+ 181 |     |      *
+ 182 |     |      * - `to` cannot be the zero address.
+ 183 |     |      */
+ 184 | *   |     function _mint(address account, uint256 amount) internal virtual {
+ 185 | *   |         if (account == address(0)) revert InvalidAccount();
+ 186 |     | 
+ 187 | *   |         totalSupply += amount;
+ 188 | *   |         balanceOf[account] += amount;
+ 189 | *   |         emit Transfer(address(0), account, amount);
+ 190 |     |     }
+ 191 |     | 
+ 192 |     |     /**
+ 193 |     |      * @dev Destroys `amount` tokens from `account`, reducing the
+ 194 |     |      * total supply.
+ 195 |     |      *
+ 196 |     |      * Emits a {Transfer} event with `to` set to the zero address.
+ 197 |     |      *
+ 198 |     |      * Requirements:
+ 199 |     |      *
+ 200 |     |      * - `account` cannot be the zero address.
+ 201 |     |      * - `account` must have at least `amount` tokens.
+ 202 |     |      */
+ 203 | *   |     function _burn(address account, uint256 amount) internal virtual {
+ 204 |     |         if (account == address(0)) revert InvalidAccount();
+ 205 |     | 
+ 206 |     |         balanceOf[account] -= amount;
+ 207 |     |         totalSupply -= amount;
+ 208 | *   |         emit Transfer(account, address(0), amount);
+ 209 |     |     }
+ 210 |     | 
+ 211 |     |     /**
+ 212 |     |      * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+ 213 |     |      *
+ 214 |     |      * This internal function is equivalent to `approve`, and can be used to
+ 215 |     |      * e.g. set automatic allowances for certain subsystems, etc.
+ 216 |     |      *
+ 217 |     |      * Emits an {Approval} event.
+ 218 |     |      *
+ 219 |     |      * Requirements:
+ 220 |     |      *
+ 221 |     |      * - `owner` cannot be the zero address.
+ 222 |     |      * - `spender` cannot be the zero address.
+ 223 |     |      */
+ 224 |     |     function _approve(
+ 225 |     |         address owner,
+ 226 |     |         address spender,
+ 227 |     |         uint256 amount
+ 228 |     |     ) internal virtual {
+ 229 |     |         if (owner == address(0) || spender == address(0)) revert InvalidAccount();
+ 230 |     | 
+ 231 |     |         allowance[owner][spender] = amount;
+ 232 |     |         emit Approval(owner, spender, amount);
+ 233 |     |     }
+ 234 |     | }
+ 235 |     | 
+
+/workspace/contracts/ERC20Permit.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | import { IERC20 } from './interfaces/IERC20.sol';
+  6 |     | import { IERC20Permit } from './interfaces/IERC20Permit.sol';
+  7 |     | 
+  8 |     | import { ERC20 } from './ERC20.sol';
+  9 |     | 
+ 10 |     | abstract contract ERC20Permit is IERC20, IERC20Permit, ERC20 {
+ 11 |     |     error PermitExpired();
+ 12 |     |     error InvalidS();
+ 13 |     |     error InvalidV();
+ 14 |     |     error InvalidSignature();
+ 15 |     | 
+ 16 |     |     bytes32 public immutable DOMAIN_SEPARATOR;
+ 17 |     | 
+ 18 |     |     string private constant EIP191_PREFIX_FOR_EIP712_STRUCTURED_DATA = '\x19\x01';
+ 19 |     | 
+ 20 |     |     // keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)')
+ 21 | *   |     bytes32 private constant DOMAIN_TYPE_SIGNATURE_HASH = bytes32(0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f);
+ 22 |     | 
+ 23 |     |     // keccak256('Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)')
+ 24 |     |     bytes32 private constant PERMIT_SIGNATURE_HASH = bytes32(0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9);
+ 25 |     | 
+ 26 |     |     mapping(address => uint256) public nonces;
+ 27 |     | 
+ 28 |     |     constructor(string memory name) {
+ 29 | *   |         DOMAIN_SEPARATOR = keccak256(
+ 30 | *   |             abi.encode(DOMAIN_TYPE_SIGNATURE_HASH, keccak256(bytes(name)), keccak256(bytes('1')), block.chainid, address(this))
+ 31 |     |         );
+ 32 |     |     }
+ 33 |     | 
+ 34 |     |     function permit(
+ 35 |     |         address issuer,
+ 36 |     |         address spender,
+ 37 |     |         uint256 value,
+ 38 |     |         uint256 deadline,
+ 39 |     |         uint8 v,
+ 40 |     |         bytes32 r,
+ 41 |     |         bytes32 s
+ 42 |     |     ) external {
+ 43 |     |         if (block.timestamp > deadline) revert PermitExpired();
+ 44 |     | 
+ 45 |     |         if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) revert InvalidS();
+ 46 |     | 
+ 47 |     |         if (v != 27 && v != 28) revert InvalidV();
+ 48 |     | 
+ 49 |     |         bytes32 digest = keccak256(
+ 50 |     |             abi.encodePacked(
+ 51 |     |                 EIP191_PREFIX_FOR_EIP712_STRUCTURED_DATA,
+ 52 |     |                 DOMAIN_SEPARATOR,
+ 53 |     |                 keccak256(abi.encode(PERMIT_SIGNATURE_HASH, issuer, spender, value, nonces[issuer]++, deadline))
+ 54 |     |             )
+ 55 |     |         );
+ 56 |     | 
+ 57 |     |         address recoveredAddress = ecrecover(digest, v, r, s);
+ 58 |     | 
+ 59 |     |         if (recoveredAddress != issuer) revert InvalidSignature();
+ 60 |     | 
+ 61 |     |         // _approve will revert if issuer is address(0x0)
+ 62 |     |         _approve(issuer, spender, value);
+ 63 |     |     }
+ 64 |     | }
+ 65 |     | 
+
+/workspace/contracts/EternalStorage.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | /**
+  6 |     |  * @title EternalStorage
+  7 |     |  * @dev This contract holds all the necessary state variables to carry out the storage of any contract.
+  8 |     |  */
+  9 |     | contract EternalStorage {
+ 10 |     |     mapping(bytes32 => uint256) private _uintStorage;
+ 11 |     |     mapping(bytes32 => string) private _stringStorage;
+ 12 |     |     mapping(bytes32 => address) private _addressStorage;
+ 13 |     |     mapping(bytes32 => bytes) private _bytesStorage;
+ 14 |     |     mapping(bytes32 => bool) private _boolStorage;
+ 15 |     |     mapping(bytes32 => int256) private _intStorage;
+ 16 |     | 
+ 17 |     |     // *** Getter Methods ***
+ 18 | *   |     function getUint(bytes32 key) public view returns (uint256) {
+ 19 | *   |         return _uintStorage[key];
+ 20 |     |     }
+ 21 |     | 
+ 22 |     |     function getString(bytes32 key) public view returns (string memory) {
+ 23 |     |         return _stringStorage[key];
+ 24 |     |     }
+ 25 |     | 
+ 26 | *   |     function getAddress(bytes32 key) public view returns (address) {
+ 27 | *   |         return _addressStorage[key];
+ 28 |     |     }
+ 29 |     | 
+ 30 |     |     function getBytes(bytes32 key) public view returns (bytes memory) {
+ 31 |     |         return _bytesStorage[key];
+ 32 |     |     }
+ 33 |     | 
+ 34 | *   |     function getBool(bytes32 key) public view returns (bool) {
+ 35 | *   |         return _boolStorage[key];
+ 36 |     |     }
+ 37 |     | 
+ 38 |     |     function getInt(bytes32 key) public view returns (int256) {
+ 39 |     |         return _intStorage[key];
+ 40 |     |     }
+ 41 |     | 
+ 42 |     |     // *** Setter Methods ***
+ 43 | *   |     function _setUint(bytes32 key, uint256 value) internal {
+ 44 | *   |         _uintStorage[key] = value;
+ 45 |     |     }
+ 46 |     | 
+ 47 |     |     function _setString(bytes32 key, string memory value) internal {
+ 48 |     |         _stringStorage[key] = value;
+ 49 |     |     }
+ 50 |     | 
+ 51 | *   |     function _setAddress(bytes32 key, address value) internal {
+ 52 | *   |         _addressStorage[key] = value;
+ 53 |     |     }
+ 54 |     | 
+ 55 |     |     function _setBytes(bytes32 key, bytes memory value) internal {
+ 56 |     |         _bytesStorage[key] = value;
+ 57 |     |     }
+ 58 |     | 
+ 59 | *   |     function _setBool(bytes32 key, bool value) internal {
+ 60 | *   |         _boolStorage[key] = value;
+ 61 |     |     }
+ 62 |     | 
+ 63 |     |     function _setInt(bytes32 key, int256 value) internal {
+ 64 |     |         _intStorage[key] = value;
+ 65 |     |     }
+ 66 |     | 
+ 67 |     |     // *** Delete Methods ***
+ 68 |     |     function _deleteUint(bytes32 key) internal {
+ 69 |     |         delete _uintStorage[key];
+ 70 |     |     }
+ 71 |     | 
+ 72 |     |     function _deleteString(bytes32 key) internal {
+ 73 |     |         delete _stringStorage[key];
+ 74 |     |     }
+ 75 |     | 
+ 76 |     |     function _deleteAddress(bytes32 key) internal {
+ 77 |     |         delete _addressStorage[key];
+ 78 |     |     }
+ 79 |     | 
+ 80 |     |     function _deleteBytes(bytes32 key) internal {
+ 81 |     |         delete _bytesStorage[key];
+ 82 |     |     }
+ 83 |     | 
+ 84 |     |     function _deleteBool(bytes32 key) internal {
+ 85 |     |         delete _boolStorage[key];
+ 86 |     |     }
+ 87 |     | 
+ 88 |     |     function _deleteInt(bytes32 key) internal {
+ 89 |     |         delete _intStorage[key];
+ 90 |     |     }
+ 91 |     | }
+ 92 |     | 
+
+/workspace/contracts/MintableCappedERC20.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | import { IMintableCappedERC20 } from './interfaces/IMintableCappedERC20.sol';
+  6 |     | 
+  7 |     | import { ERC20 } from './ERC20.sol';
+  8 |     | import { ERC20Permit } from './ERC20Permit.sol';
+  9 |     | import { Ownable } from './Ownable.sol';
+ 10 |     | 
+ 11 |     | contract MintableCappedERC20 is IMintableCappedERC20, ERC20, ERC20Permit, Ownable {
+ 12 |     |     uint256 public immutable cap;
+ 13 |     | 
+ 14 |     |     constructor(
+ 15 |     |         string memory name,
+ 16 |     |         string memory symbol,
+ 17 |     |         uint8 decimals,
+ 18 |     |         uint256 capacity
+ 19 | *   |     ) ERC20(name, symbol, decimals) ERC20Permit(name) Ownable() {
+ 20 | *   |         cap = capacity;
+ 21 |     |     }
+ 22 |     | 
+ 23 | *   |     function mint(address account, uint256 amount) external onlyOwner {
+ 24 | *   |         uint256 capacity = cap;
+ 25 |     | 
+ 26 | *   |         _mint(account, amount);
+ 27 |     | 
+ 28 | *   |         if (capacity == 0) return;
+ 29 |     | 
+ 30 | *   |         if (totalSupply > capacity) revert CapExceeded();
+ 31 |     |     }
+ 32 |     | }
+ 33 |     | 
+
+/workspace/contracts/Ownable.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity 0.8.9;
+  4 |     | 
+  5 |     | import { IOwnable } from './interfaces/IOwnable.sol';
+  6 |     | 
+  7 |     | abstract contract Ownable is IOwnable {
+  8 |     |     address public owner;
+  9 |     | 
+ 10 |     |     constructor() {
+ 11 | *   |         owner = msg.sender;
+ 12 | *   |         emit OwnershipTransferred(address(0), msg.sender);
+ 13 |     |     }
+ 14 |     | 
+ 15 |     |     modifier onlyOwner() {
+ 16 | *   |         if (owner != msg.sender) revert NotOwner();
+ 17 |     | 
+ 18 |     |         _;
+ 19 |     |     }
+ 20 |     | 
+ 21 |     |     function transferOwnership(address newOwner) external virtual onlyOwner {
+ 22 |     |         if (newOwner == address(0)) revert InvalidOwner();
+ 23 |     | 
+ 24 |     |         emit OwnershipTransferred(owner, newOwner);
+ 25 |     |         owner = newOwner;
+ 26 |     |     }
+ 27 |     | }
+ 28 |     | 
+
+/workspace/contracts/TokenDeployer.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | import { ITokenDeployer } from './interfaces/ITokenDeployer.sol';
+  6 |     | 
+  7 |     | import { BurnableMintableCappedERC20 } from './BurnableMintableCappedERC20.sol';
+  8 |     | 
+  9 | *   | contract TokenDeployer is ITokenDeployer {
+ 10 | *   |     function deployToken(
+ 11 |     |         string calldata name,
+ 12 |     |         string calldata symbol,
+ 13 |     |         uint8 decimals,
+ 14 |     |         uint256 cap,
+ 15 |     |         bytes32 salt
+ 16 | *   |     ) external returns (address tokenAddress) {
+ 17 | *   |         tokenAddress = address(new BurnableMintableCappedERC20{ salt: salt }(name, symbol, decimals, cap));
+ 18 |     |     }
+ 19 |     | }
+ 20 |     | 
+
+/workspace/contracts/echidna/EchidnaGatewayCap.sol
+   1 |     | // SPDX-License-Identifier: MIT
+   2 |     | pragma solidity 0.8.9;
+   3 |     | 
+   4 |     | import { AxelarGateway } from '../AxelarGateway.sol';
+   5 |     | import { TokenDeployer } from '../TokenDeployer.sol';
+   6 |     | import { IBurnableMintableCappedERC20 } from '../interfaces/IBurnableMintableCappedERC20.sol';
+   7 |     | import { IAxelarAuth } from '../interfaces/IAxelarAuth.sol';
+   8 |     | import { ECDSA } from '../ECDSA.sol';
+   9 |     | 
+  10 | *   | contract EchidnaAuthMock is IAxelarAuth {
+  11 |     |     address private _owner;
+  12 |     |     address private _pendingOwner;
+  13 |     | 
+  14 | *   |     constructor() {
+  15 | *   |         _owner = msg.sender;
+  16 |     |     }
+  17 |     | 
+  18 | *   |     function validateProof(bytes32, bytes calldata) external pure returns (bool) {
+  19 | *   |         return true;
+  20 |     |     }
+  21 |     | 
+  22 |     |     function transferOperatorship(bytes calldata) external {}
+  23 |     | 
+  24 |     |     // IOwnable minimal implementation
+  25 |     |     function owner() external view returns (address) {
+  26 |     |         return _owner;
+  27 |     |     }
+  28 |     | 
+  29 |     |     function pendingOwner() external view returns (address) {
+  30 |     |         return _pendingOwner;
+  31 |     |     }
+  32 |     | 
+  33 |     |     function proposeOwnership(address newOwner) external {
+  34 |     |         _pendingOwner = newOwner;
+  35 |     |     }
+  36 |     | 
+  37 |     |     function transferOwnership(address newOwner) external {
+  38 |     |         _owner = newOwner;
+  39 |     |     }
+  40 |     | 
+  41 |     |     function acceptOwnership() external {
+  42 |     |         _owner = _pendingOwner;
+  43 |     |         _pendingOwner = address(0);
+  44 |     |     }
+  45 |     | }
+  46 |     | 
+  47 | *r  | contract EchidnaGatewayCap {
+  48 | *   |     AxelarGateway public gateway;
+  49 | *   |     TokenDeployer public deployer;
+  50 | *   |     IBurnableMintableCappedERC20 public token;
+  51 |     | 
+  52 | *   |     constructor() {
+  53 | *   |         EchidnaAuthMock auth = new EchidnaAuthMock();
+  54 | *   |         deployer = new TokenDeployer();
+  55 | *   |         gateway = new AxelarGateway(address(auth), address(deployer));
+  56 |     | 
+  57 |     |         // Deploy internal token via execute
+  58 | *   |         string memory name = 'Token';
+  59 | *   |         string memory symbol = 'TKN';
+  60 | *   |         uint8 decs = 18;
+  61 | *   |         uint256 cap = 1_000_000 ether;
+  62 | *   |         bytes memory deployParams = abi.encode(name, symbol, decs, cap, address(0), uint256(0));
+  63 | *   |         uint256 chainId = block.chainid;
+  64 | *   |         bytes32[] memory ids = new bytes32[](1);
+  65 | *   |         ids[0] = keccak256('cmd-deploy');
+  66 | *   |         string[] memory cmds = new string[](1);
+  67 | *   |         cmds[0] = 'deployToken';
+  68 | *   |         bytes[] memory params = new bytes[](1);
+  69 | *   |         params[0] = deployParams;
+  70 |     | 
+  71 | *   |         bytes memory data = abi.encode(chainId, ids, cmds, params);
+  72 | *   |         bytes memory input = abi.encode(data, bytes(''));
+  73 | *   |         (bool ok, ) = address(gateway).call(abi.encodeWithSelector(AxelarGateway.execute.selector, input));
+  74 | *   |         require(ok, 'deploy failed');
+  75 | *   |         token = IBurnableMintableCappedERC20(gateway.tokenAddresses(symbol));
+  76 |     |     }
+  77 |     | 
+  78 |     |     // Action: attempt to mint arbitrary amount
+  79 | *   |     function mint(uint256 amount) public {
+  80 | *   |         bytes32[] memory ids = new bytes32[](1);
+  81 | *   |         ids[0] = keccak256(abi.encodePacked('cmd-mint', amount));
+  82 | *   |         string[] memory cmds = new string[](1);
+  83 | *   |         cmds[0] = 'mintToken';
+  84 | *   |         bytes[] memory params = new bytes[](1);
+  85 | *   |         params[0] = abi.encode('TKN', address(this), amount);
+  86 | *   |         bytes memory data = abi.encode(block.chainid, ids, cmds, params);
+  87 | *   |         bytes memory input = abi.encode(data, bytes(''));
+  88 |     |         // ignore success/failure; property checks totalSupply
+  89 |     |         // solhint-disable-next-line avoid-low-level-calls
+  90 | *   |         address(gateway).call(abi.encodeWithSelector(AxelarGateway.execute.selector, input));
+  91 |     |     }
+  92 |     | 
+  93 |     |     // Invariant: totalSupply never exceeds cap
+  94 |     |     function echidna_totalSupply_lte_cap() public view returns (bool) {
+  95 |     |         return token.totalSupply() <= token.cap();
+  96 |     |     }
+  97 |     | }
+  98 |     | 
+  99 |     | 
+
+/workspace/contracts/interfaces/IAxelarAuth.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | import { IOwnable } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IOwnable.sol';
+  6 |     | 
+  7 |     | interface IAxelarAuth is IOwnable {
+  8 |     |     function validateProof(bytes32 messageHash, bytes calldata proof) external returns (bool currentOperators);
+  9 |     | 
+ 10 |     |     function transferOperatorship(bytes calldata params) external;
+ 11 |     | }
+ 12 |     | 
+
+/workspace/contracts/interfaces/IAxelarConsensusGateway.sol
+   1 |     | // SPDX-License-Identifier: MIT
+   2 |     | 
+   3 |     | pragma solidity ^0.8.0;
+   4 |     | 
+   5 |     | import { IGovernable } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IGovernable.sol';
+   6 |     | import { IImplementation } from '@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IImplementation.sol';
+   7 |     | 
+   8 |     | interface IAxelarConsensusGateway is IImplementation, IGovernable {
+   9 |     |     /**********\
+  10 |     |     |* Errors *|
+  11 |     |     \**********/
+  12 |     | 
+  13 |     |     error NotSelf();
+  14 |     |     error InvalidCodeHash();
+  15 |     |     error SetupFailed();
+  16 |     |     error InvalidAuthModule();
+  17 |     |     error InvalidTokenDeployer();
+  18 |     |     error InvalidAmount();
+  19 |     |     error InvalidChainId();
+  20 |     |     error InvalidCommands();
+  21 |     |     error TokenDoesNotExist(string symbol);
+  22 |     |     error TokenAlreadyExists(string symbol);
+  23 |     |     error TokenDeployFailed(string symbol);
+  24 |     |     error TokenContractDoesNotExist(address token);
+  25 |     |     error BurnFailed(string symbol);
+  26 |     |     error MintFailed(string symbol);
+  27 |     |     error InvalidSetMintLimitsParams();
+  28 |     |     error ExceedMintLimit(string symbol);
+  29 |     | 
+  30 |     |     /**********\
+  31 |     |     |* Events *|
+  32 |     |     \**********/
+  33 |     | 
+  34 |     |     event TokenSent(address indexed sender, string destinationChain, string destinationAddress, string symbol, uint256 amount);
+  35 |     | 
+  36 |     |     event ContractCall(
+  37 |     |         address indexed sender,
+  38 |     |         string destinationChain,
+  39 |     |         string destinationContractAddress,
+  40 |     |         bytes32 indexed payloadHash,
+  41 |     |         bytes payload
+  42 |     |     );
+  43 |     | 
+  44 |     |     event ContractCallWithToken(
+  45 |     |         address indexed sender,
+  46 |     |         string destinationChain,
+  47 |     |         string destinationContractAddress,
+  48 |     |         bytes32 indexed payloadHash,
+  49 |     |         bytes payload,
+  50 |     |         string symbol,
+  51 |     |         uint256 amount
+  52 |     |     );
+  53 |     | 
+  54 |     |     event Executed(bytes32 indexed commandId);
+  55 |     | 
+  56 |     |     event TokenDeployed(string symbol, address tokenAddresses);
+  57 |     | 
+  58 |     |     event ContractCallApproved(
+  59 |     |         bytes32 indexed commandId,
+  60 |     |         string sourceChain,
+  61 |     |         string sourceAddress,
+  62 |     |         address indexed contractAddress,
+  63 |     |         bytes32 indexed payloadHash,
+  64 |     |         bytes32 sourceTxHash,
+  65 |     |         uint256 sourceEventIndex
+  66 |     |     );
+  67 |     | 
+  68 |     |     event ContractCallApprovedWithMint(
+  69 |     |         bytes32 indexed commandId,
+  70 |     |         string sourceChain,
+  71 |     |         string sourceAddress,
+  72 |     |         address indexed contractAddress,
+  73 |     |         bytes32 indexed payloadHash,
+  74 |     |         string symbol,
+  75 |     |         uint256 amount,
+  76 |     |         bytes32 sourceTxHash,
+  77 |     |         uint256 sourceEventIndex
+  78 |     |     );
+  79 |     | 
+  80 |     |     event ContractCallExecuted(bytes32 indexed commandId);
+  81 |     | 
+  82 |     |     event TokenMintLimitUpdated(string symbol, uint256 limit);
+  83 |     | 
+  84 |     |     event OperatorshipTransferred(bytes newOperatorsData);
+  85 |     | 
+  86 |     |     event Upgraded(address indexed implementation);
+  87 |     | 
+  88 |     |     /********************\
+  89 |     |     |* Public Functions *|
+  90 |     |     \********************/
+  91 |     | 
+  92 |     |     function sendToken(
+  93 |     |         string calldata destinationChain,
+  94 |     |         string calldata destinationAddress,
+  95 |     |         string calldata symbol,
+  96 |     |         uint256 amount
+  97 |     |     ) external;
+  98 |     | 
+  99 |     |     function callContract(
+ 100 |     |         string calldata destinationChain,
+ 101 |     |         string calldata contractAddress,
+ 102 |     |         bytes calldata payload
+ 103 |     |     ) external;
+ 104 |     | 
+ 105 |     |     function callContractWithToken(
+ 106 |     |         string calldata destinationChain,
+ 107 |     |         string calldata contractAddress,
+ 108 |     |         bytes calldata payload,
+ 109 |     |         string calldata symbol,
+ 110 |     |         uint256 amount
+ 111 |     |     ) external;
+ 112 |     | 
+ 113 |     |     function isContractCallApproved(
+ 114 |     |         bytes32 commandId,
+ 115 |     |         string calldata sourceChain,
+ 116 |     |         string calldata sourceAddress,
+ 117 |     |         address contractAddress,
+ 118 |     |         bytes32 payloadHash
+ 119 |     |     ) external view returns (bool);
+ 120 |     | 
+ 121 |     |     function isContractCallAndMintApproved(
+ 122 |     |         bytes32 commandId,
+ 123 |     |         string calldata sourceChain,
+ 124 |     |         string calldata sourceAddress,
+ 125 |     |         address contractAddress,
+ 126 |     |         bytes32 payloadHash,
+ 127 |     |         string calldata symbol,
+ 128 |     |         uint256 amount
+ 129 |     |     ) external view returns (bool);
+ 130 |     | 
+ 131 |     |     function validateContractCall(
+ 132 |     |         bytes32 commandId,
+ 133 |     |         string calldata sourceChain,
+ 134 |     |         string calldata sourceAddress,
+ 135 |     |         bytes32 payloadHash
+ 136 |     |     ) external returns (bool);
+ 137 |     | 
+ 138 |     |     function validateContractCallAndMint(
+ 139 |     |         bytes32 commandId,
+ 140 |     |         string calldata sourceChain,
+ 141 |     |         string calldata sourceAddress,
+ 142 |     |         bytes32 payloadHash,
+ 143 |     |         string calldata symbol,
+ 144 |     |         uint256 amount
+ 145 |     |     ) external returns (bool);
+ 146 |     | 
+ 147 |     |     /***********\
+ 148 |     |     |* Getters *|
+ 149 |     |     \***********/
+ 150 |     | 
+ 151 |     |     function authModule() external view returns (address);
+ 152 |     | 
+ 153 |     |     function tokenDeployer() external view returns (address);
+ 154 |     | 
+ 155 |     |     function tokenMintLimit(string memory symbol) external view returns (uint256);
+ 156 |     | 
+ 157 |     |     function tokenMintAmount(string memory symbol) external view returns (uint256);
+ 158 |     | 
+ 159 |     |     function allTokensFrozen() external view returns (bool);
+ 160 |     | 
+ 161 |     |     function implementation() external view returns (address);
+ 162 |     | 
+ 163 |     |     function tokenAddresses(string memory symbol) external view returns (address);
+ 164 |     | 
+ 165 |     |     function tokenFrozen(string memory symbol) external view returns (bool);
+ 166 |     | 
+ 167 |     |     function isCommandExecuted(bytes32 commandId) external view returns (bool);
+ 168 |     | 
+ 169 |     |     /************************\
+ 170 |     |     |* Governance Functions *|
+ 171 |     |     \************************/
+ 172 |     | 
+ 173 |     |     function setTokenMintLimits(string[] calldata symbols, uint256[] calldata limits) external;
+ 174 |     | 
+ 175 |     |     function upgrade(
+ 176 |     |         address newImplementation,
+ 177 |     |         bytes32 newImplementationCodeHash,
+ 178 |     |         bytes calldata setupParams
+ 179 |     |     ) external;
+ 180 |     | 
+ 181 |     |     /**********************\
+ 182 |     |     |* External Functions *|
+ 183 |     |     \**********************/
+ 184 |     | 
+ 185 |     |     function execute(bytes calldata input) external;
+ 186 |     | }
+ 187 |     | 
+
+/workspace/contracts/interfaces/IAxelarGateway.sol
+   1 |     | // SPDX-License-Identifier: MIT
+   2 |     | 
+   3 |     | pragma solidity ^0.8.9;
+   4 |     | 
+   5 |     | interface IAxelarGateway {
+   6 |     |     /**********\
+   7 |     |     |* Errors *|
+   8 |     |     \**********/
+   9 |     | 
+  10 |     |     error NotSelf();
+  11 |     |     error NotProxy();
+  12 |     |     error InvalidCodeHash();
+  13 |     |     error SetupFailed();
+  14 |     |     error InvalidAuthModule();
+  15 |     |     error InvalidTokenDeployer();
+  16 |     |     error InvalidAmount();
+  17 |     |     error InvalidChainId();
+  18 |     |     error InvalidCommands();
+  19 |     |     error TokenDoesNotExist(string symbol);
+  20 |     |     error TokenAlreadyExists(string symbol);
+  21 |     |     error TokenDeployFailed(string symbol);
+  22 |     |     error TokenContractDoesNotExist(address token);
+  23 |     |     error BurnFailed(string symbol);
+  24 |     |     error MintFailed(string symbol);
+  25 |     |     error InvalidSetMintLimitsParams();
+  26 |     |     error ExceedMintLimit(string symbol);
+  27 |     | 
+  28 |     |     /**********\
+  29 |     |     |* Events *|
+  30 |     |     \**********/
+  31 |     | 
+  32 |     |     event TokenSent(address indexed sender, string destinationChain, string destinationAddress, string symbol, uint256 amount);
+  33 |     | 
+  34 |     |     event ContractCall(
+  35 |     |         address indexed sender,
+  36 |     |         string destinationChain,
+  37 |     |         string destinationContractAddress,
+  38 |     |         bytes32 indexed payloadHash,
+  39 |     |         bytes payload
+  40 |     |     );
+  41 |     | 
+  42 |     |     event ContractCallWithToken(
+  43 |     |         address indexed sender,
+  44 |     |         string destinationChain,
+  45 |     |         string destinationContractAddress,
+  46 |     |         bytes32 indexed payloadHash,
+  47 |     |         bytes payload,
+  48 |     |         string symbol,
+  49 |     |         uint256 amount
+  50 |     |     );
+  51 |     | 
+  52 |     |     event Executed(bytes32 indexed commandId);
+  53 |     | 
+  54 |     |     event TokenDeployed(string symbol, address tokenAddresses);
+  55 |     | 
+  56 |     |     event ContractCallApproved(
+  57 |     |         bytes32 indexed commandId,
+  58 |     |         string sourceChain,
+  59 |     |         string sourceAddress,
+  60 |     |         address indexed contractAddress,
+  61 |     |         bytes32 indexed payloadHash,
+  62 |     |         bytes32 sourceTxHash,
+  63 |     |         uint256 sourceEventIndex
+  64 |     |     );
+  65 |     | 
+  66 |     |     event ContractCallApprovedWithMint(
+  67 |     |         bytes32 indexed commandId,
+  68 |     |         string sourceChain,
+  69 |     |         string sourceAddress,
+  70 |     |         address indexed contractAddress,
+  71 |     |         bytes32 indexed payloadHash,
+  72 |     |         string symbol,
+  73 |     |         uint256 amount,
+  74 |     |         bytes32 sourceTxHash,
+  75 |     |         uint256 sourceEventIndex
+  76 |     |     );
+  77 |     | 
+  78 |     |     event TokenMintLimitUpdated(string symbol, uint256 limit);
+  79 |     | 
+  80 |     |     event OperatorshipTransferred(bytes newOperatorsData);
+  81 |     | 
+  82 |     |     event Upgraded(address indexed implementation);
+  83 |     | 
+  84 |     |     /********************\
+  85 |     |     |* Public Functions *|
+  86 |     |     \********************/
+  87 |     | 
+  88 |     |     function sendToken(
+  89 |     |         string calldata destinationChain,
+  90 |     |         string calldata destinationAddress,
+  91 |     |         string calldata symbol,
+  92 |     |         uint256 amount
+  93 |     |     ) external;
+  94 |     | 
+  95 |     |     function callContract(
+  96 |     |         string calldata destinationChain,
+  97 |     |         string calldata contractAddress,
+  98 |     |         bytes calldata payload
+  99 |     |     ) external;
+ 100 |     | 
+ 101 |     |     function callContractWithToken(
+ 102 |     |         string calldata destinationChain,
+ 103 |     |         string calldata contractAddress,
+ 104 |     |         bytes calldata payload,
+ 105 |     |         string calldata symbol,
+ 106 |     |         uint256 amount
+ 107 |     |     ) external;
+ 108 |     | 
+ 109 |     |     function isContractCallApproved(
+ 110 |     |         bytes32 commandId,
+ 111 |     |         string calldata sourceChain,
+ 112 |     |         string calldata sourceAddress,
+ 113 |     |         address contractAddress,
+ 114 |     |         bytes32 payloadHash
+ 115 |     |     ) external view returns (bool);
+ 116 |     | 
+ 117 |     |     function isContractCallAndMintApproved(
+ 118 |     |         bytes32 commandId,
+ 119 |     |         string calldata sourceChain,
+ 120 |     |         string calldata sourceAddress,
+ 121 |     |         address contractAddress,
+ 122 |     |         bytes32 payloadHash,
+ 123 |     |         string calldata symbol,
+ 124 |     |         uint256 amount
+ 125 |     |     ) external view returns (bool);
+ 126 |     | 
+ 127 |     |     function validateContractCall(
+ 128 |     |         bytes32 commandId,
+ 129 |     |         string calldata sourceChain,
+ 130 |     |         string calldata sourceAddress,
+ 131 |     |         bytes32 payloadHash
+ 132 |     |     ) external returns (bool);
+ 133 |     | 
+ 134 |     |     function validateContractCallAndMint(
+ 135 |     |         bytes32 commandId,
+ 136 |     |         string calldata sourceChain,
+ 137 |     |         string calldata sourceAddress,
+ 138 |     |         bytes32 payloadHash,
+ 139 |     |         string calldata symbol,
+ 140 |     |         uint256 amount
+ 141 |     |     ) external returns (bool);
+ 142 |     | 
+ 143 |     |     /***********\
+ 144 |     |     |* Getters *|
+ 145 |     |     \***********/
+ 146 |     | 
+ 147 |     |     function authModule() external view returns (address);
+ 148 |     | 
+ 149 |     |     function tokenDeployer() external view returns (address);
+ 150 |     | 
+ 151 |     |     function tokenMintLimit(string memory symbol) external view returns (uint256);
+ 152 |     | 
+ 153 |     |     function tokenMintAmount(string memory symbol) external view returns (uint256);
+ 154 |     | 
+ 155 |     |     function allTokensFrozen() external view returns (bool);
+ 156 |     | 
+ 157 |     |     function implementation() external view returns (address);
+ 158 |     | 
+ 159 |     |     function tokenAddresses(string memory symbol) external view returns (address);
+ 160 |     | 
+ 161 |     |     function tokenFrozen(string memory symbol) external view returns (bool);
+ 162 |     | 
+ 163 |     |     function isCommandExecuted(bytes32 commandId) external view returns (bool);
+ 164 |     | 
+ 165 |     |     function adminEpoch() external view returns (uint256);
+ 166 |     | 
+ 167 |     |     function adminThreshold(uint256 epoch) external view returns (uint256);
+ 168 |     | 
+ 169 |     |     function admins(uint256 epoch) external view returns (address[] memory);
+ 170 |     | 
+ 171 |     |     /*******************\
+ 172 |     |     |* Admin Functions *|
+ 173 |     |     \*******************/
+ 174 |     | 
+ 175 |     |     function setTokenMintLimits(string[] calldata symbols, uint256[] calldata limits) external;
+ 176 |     | 
+ 177 |     |     function upgrade(
+ 178 |     |         address newImplementation,
+ 179 |     |         bytes32 newImplementationCodeHash,
+ 180 |     |         bytes calldata setupParams
+ 181 |     |     ) external;
+ 182 |     | 
+ 183 |     |     /**********************\
+ 184 |     |     |* External Functions *|
+ 185 |     |     \**********************/
+ 186 |     | 
+ 187 |     |     function setup(bytes calldata params) external;
+ 188 |     | 
+ 189 |     |     function execute(bytes calldata input) external;
+ 190 |     | }
+ 191 |     | 
+
+/workspace/contracts/interfaces/IBurnableMintableCappedERC20.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.9;
+  4 |     | 
+  5 |     | import { IERC20Burn } from './IERC20Burn.sol';
+  6 |     | import { IERC20BurnFrom } from './IERC20BurnFrom.sol';
+  7 |     | import { IMintableCappedERC20 } from './IMintableCappedERC20.sol';
+  8 |     | 
+  9 |     | interface IBurnableMintableCappedERC20 is IERC20Burn, IERC20BurnFrom, IMintableCappedERC20 {
+ 10 |     |     function depositAddress(bytes32 salt) external view returns (address);
+ 11 |     | 
+ 12 |     |     function burn(bytes32 salt) external;
+ 13 |     | 
+ 14 |     |     function burnFrom(address account, uint256 amount) external;
+ 15 |     | }
+ 16 |     | 
+
+/workspace/contracts/interfaces/IERC20.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.9;
+  4 |     | 
+  5 |     | /**
+  6 |     |  * @dev Interface of the ERC20 standard as defined in the EIP.
+  7 |     |  */
+  8 |     | interface IERC20 {
+  9 |     |     error InvalidAccount();
+ 10 |     | 
+ 11 |     |     /**
+ 12 |     |      * @dev Returns the amount of tokens in existence.
+ 13 |     |      */
+ 14 |     |     function totalSupply() external view returns (uint256);
+ 15 |     | 
+ 16 |     |     /**
+ 17 |     |      * @dev Returns the amount of tokens owned by `account`.
+ 18 |     |      */
+ 19 |     |     function balanceOf(address account) external view returns (uint256);
+ 20 |     | 
+ 21 |     |     /**
+ 22 |     |      * @dev Moves `amount` tokens from the caller's account to `recipient`.
+ 23 |     |      *
+ 24 |     |      * Returns a boolean value indicating whether the operation succeeded.
+ 25 |     |      *
+ 26 |     |      * Emits a {Transfer} event.
+ 27 |     |      */
+ 28 |     |     function transfer(address recipient, uint256 amount) external returns (bool);
+ 29 |     | 
+ 30 |     |     /**
+ 31 |     |      * @dev Returns the remaining number of tokens that `spender` will be
+ 32 |     |      * allowed to spend on behalf of `owner` through {transferFrom}. This is
+ 33 |     |      * zero by default.
+ 34 |     |      *
+ 35 |     |      * This value changes when {approve} or {transferFrom} are called.
+ 36 |     |      */
+ 37 |     |     function allowance(address owner, address spender) external view returns (uint256);
+ 38 |     | 
+ 39 |     |     /**
+ 40 |     |      * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+ 41 |     |      *
+ 42 |     |      * Returns a boolean value indicating whether the operation succeeded.
+ 43 |     |      *
+ 44 |     |      * IMPORTANT: Beware that changing an allowance with this method brings the risk
+ 45 |     |      * that someone may use both the old and the new allowance by unfortunate
+ 46 |     |      * transaction ordering. One possible solution to mitigate this race
+ 47 |     |      * condition is to first reduce the spender's allowance to 0 and set the
+ 48 |     |      * desired value afterwards:
+ 49 |     |      * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+ 50 |     |      *
+ 51 |     |      * Emits an {Approval} event.
+ 52 |     |      */
+ 53 |     |     function approve(address spender, uint256 amount) external returns (bool);
+ 54 |     | 
+ 55 |     |     /**
+ 56 |     |      * @dev Moves `amount` tokens from `sender` to `recipient` using the
+ 57 |     |      * allowance mechanism. `amount` is then deducted from the caller's
+ 58 |     |      * allowance.
+ 59 |     |      *
+ 60 |     |      * Returns a boolean value indicating whether the operation succeeded.
+ 61 |     |      *
+ 62 |     |      * Emits a {Transfer} event.
+ 63 |     |      */
+ 64 |     |     function transferFrom(
+ 65 |     |         address sender,
+ 66 |     |         address recipient,
+ 67 |     |         uint256 amount
+ 68 |     |     ) external returns (bool);
+ 69 |     | 
+ 70 |     |     /**
+ 71 |     |      * @dev Emitted when `value` tokens are moved from one account (`from`) to
+ 72 |     |      * another (`to`).
+ 73 |     |      *
+ 74 |     |      * Note that `value` may be zero.
+ 75 |     |      */
+ 76 |     |     event Transfer(address indexed from, address indexed to, uint256 value);
+ 77 |     | 
+ 78 |     |     /**
+ 79 |     |      * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+ 80 |     |      * a call to {approve}. `value` is the new allowance.
+ 81 |     |      */
+ 82 |     |     event Approval(address indexed owner, address indexed spender, uint256 value);
+ 83 |     | }
+ 84 |     | 
+
+/workspace/contracts/interfaces/IERC20Burn.sol
+ 1 |     | // SPDX-License-Identifier: MIT
+ 2 |     | 
+ 3 |     | pragma solidity ^0.8.9;
+ 4 |     | 
+ 5 |     | interface IERC20Burn {
+ 6 |     |     function burn(bytes32 salt) external;
+ 7 |     | }
+ 8 |     | 
+
+/workspace/contracts/interfaces/IERC20BurnFrom.sol
+ 1 |     | // SPDX-License-Identifier: MIT
+ 2 |     | 
+ 3 |     | pragma solidity ^0.8.9;
+ 4 |     | 
+ 5 |     | interface IERC20BurnFrom {
+ 6 |     |     function burnFrom(address account, uint256 amount) external;
+ 7 |     | }
+ 8 |     | 
+
+/workspace/contracts/interfaces/IERC20Permit.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.9;
+  4 |     | 
+  5 |     | interface IERC20Permit {
+  6 |     |     function DOMAIN_SEPARATOR() external view returns (bytes32);
+  7 |     | 
+  8 |     |     function nonces(address account) external view returns (uint256);
+  9 |     | 
+ 10 |     |     function permit(
+ 11 |     |         address issuer,
+ 12 |     |         address spender,
+ 13 |     |         uint256 value,
+ 14 |     |         uint256 deadline,
+ 15 |     |         uint8 v,
+ 16 |     |         bytes32 r,
+ 17 |     |         bytes32 s
+ 18 |     |     ) external;
+ 19 |     | }
+ 20 |     | 
+
+/workspace/contracts/interfaces/IMintableCappedERC20.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.9;
+  4 |     | 
+  5 |     | import { IERC20 } from './IERC20.sol';
+  6 |     | import { IERC20Permit } from './IERC20Permit.sol';
+  7 |     | import { IOwnable } from './IOwnable.sol';
+  8 |     | 
+  9 |     | interface IMintableCappedERC20 is IERC20, IERC20Permit, IOwnable {
+ 10 |     |     error CapExceeded();
+ 11 |     | 
+ 12 |     |     function cap() external view returns (uint256);
+ 13 |     | 
+ 14 |     |     function mint(address account, uint256 amount) external;
+ 15 |     | }
+ 16 |     | 
+
+/workspace/contracts/interfaces/IOwnable.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.9;
+  4 |     | 
+  5 |     | interface IOwnable {
+  6 |     |     error NotOwner();
+  7 |     |     error InvalidOwner();
+  8 |     | 
+  9 |     |     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+ 10 |     | 
+ 11 |     |     function owner() external view returns (address);
+ 12 |     | 
+ 13 |     |     function transferOwnership(address newOwner) external;
+ 14 |     | }
+ 15 |     | 
+
+/workspace/contracts/interfaces/ITokenDeployer.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | interface ITokenDeployer {
+  6 |     |     function deployToken(
+  7 |     |         string calldata name,
+  8 |     |         string calldata symbol,
+  9 |     |         uint8 decimals,
+ 10 |     |         uint256 cap,
+ 11 |     |         bytes32 salt
+ 12 |     |     ) external returns (address tokenAddress);
+ 13 |     | }
+ 14 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IContractIdentifier.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | // General interface for upgradable contracts
+  6 |     | interface IContractIdentifier {
+  7 |     |     /**
+  8 |     |      * @notice Returns the contract ID. It can be used as a check during upgrades.
+  9 |     |      * @dev Meant to be overridden in derived contracts.
+ 10 |     |      * @return bytes32 The contract ID
+ 11 |     |      */
+ 12 |     |     function contractId() external pure returns (bytes32);
+ 13 |     | }
+ 14 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IERC20.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | /**
+  6 |     |  * @dev Interface of the ERC20 standard as defined in the EIP.
+  7 |     |  */
+  8 |     | interface IERC20 {
+  9 |     |     error InvalidAccount();
+ 10 |     | 
+ 11 |     |     /**
+ 12 |     |      * @dev Returns the amount of tokens in existence.
+ 13 |     |      */
+ 14 |     |     function totalSupply() external view returns (uint256);
+ 15 |     | 
+ 16 |     |     /**
+ 17 |     |      * @dev Returns the amount of tokens owned by `account`.
+ 18 |     |      */
+ 19 |     |     function balanceOf(address account) external view returns (uint256);
+ 20 |     | 
+ 21 |     |     /**
+ 22 |     |      * @dev Moves `amount` tokens from the caller's account to `recipient`.
+ 23 |     |      *
+ 24 |     |      * Returns a boolean value indicating whether the operation succeeded.
+ 25 |     |      *
+ 26 |     |      * Emits a {Transfer} event.
+ 27 |     |      */
+ 28 |     |     function transfer(address recipient, uint256 amount) external returns (bool);
+ 29 |     | 
+ 30 |     |     /**
+ 31 |     |      * @dev Returns the remaining number of tokens that `spender` will be
+ 32 |     |      * allowed to spend on behalf of `owner` through {transferFrom}. This is
+ 33 |     |      * zero by default.
+ 34 |     |      *
+ 35 |     |      * This value changes when {approve} or {transferFrom} are called.
+ 36 |     |      */
+ 37 |     |     function allowance(address owner, address spender) external view returns (uint256);
+ 38 |     | 
+ 39 |     |     /**
+ 40 |     |      * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+ 41 |     |      *
+ 42 |     |      * Returns a boolean value indicating whether the operation succeeded.
+ 43 |     |      *
+ 44 |     |      * IMPORTANT: Beware that changing an allowance with this method brings the risk
+ 45 |     |      * that someone may use both the old and the new allowance by unfortunate
+ 46 |     |      * transaction ordering. One possible solution to mitigate this race
+ 47 |     |      * condition is to first reduce the spender's allowance to 0 and set the
+ 48 |     |      * desired value afterwards:
+ 49 |     |      * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+ 50 |     |      *
+ 51 |     |      * Emits an {Approval} event.
+ 52 |     |      */
+ 53 |     |     function approve(address spender, uint256 amount) external returns (bool);
+ 54 |     | 
+ 55 |     |     /**
+ 56 |     |      * @dev Moves `amount` tokens from `sender` to `recipient` using the
+ 57 |     |      * allowance mechanism. `amount` is then deducted from the caller's
+ 58 |     |      * allowance.
+ 59 |     |      *
+ 60 |     |      * Returns a boolean value indicating whether the operation succeeded.
+ 61 |     |      *
+ 62 |     |      * Emits a {Transfer} event.
+ 63 |     |      */
+ 64 |     |     function transferFrom(
+ 65 |     |         address sender,
+ 66 |     |         address recipient,
+ 67 |     |         uint256 amount
+ 68 |     |     ) external returns (bool);
+ 69 |     | 
+ 70 |     |     /**
+ 71 |     |      * @dev Emitted when `value` tokens are moved from one account (`from`) to
+ 72 |     |      * another (`to`).
+ 73 |     |      *
+ 74 |     |      * Note that `value` may be zero.
+ 75 |     |      */
+ 76 |     |     event Transfer(address indexed from, address indexed to, uint256 value);
+ 77 |     | 
+ 78 |     |     /**
+ 79 |     |      * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+ 80 |     |      * a call to {approve}. `value` is the new allowance.
+ 81 |     |      */
+ 82 |     |     event Approval(address indexed owner, address indexed spender, uint256 value);
+ 83 |     | }
+ 84 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IGovernable.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | /**
+  6 |     |  * @title IGovernable Interface
+  7 |     |  * @notice This is an interface used by the AxelarGateway contract to manage governance and mint limiter roles.
+  8 |     |  */
+  9 |     | interface IGovernable {
+ 10 |     |     error NotGovernance();
+ 11 |     |     error NotMintLimiter();
+ 12 |     |     error InvalidGovernance();
+ 13 |     |     error InvalidMintLimiter();
+ 14 |     | 
+ 15 |     |     event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
+ 16 |     |     event MintLimiterTransferred(address indexed previousGovernance, address indexed newGovernance);
+ 17 |     | 
+ 18 |     |     /**
+ 19 |     |      * @notice Returns the governance address.
+ 20 |     |      * @return address of the governance
+ 21 |     |      */
+ 22 |     |     function governance() external view returns (address);
+ 23 |     | 
+ 24 |     |     /**
+ 25 |     |      * @notice Returns the mint limiter address.
+ 26 |     |      * @return address of the mint limiter
+ 27 |     |      */
+ 28 |     |     function mintLimiter() external view returns (address);
+ 29 |     | 
+ 30 |     |     /**
+ 31 |     |      * @notice Transfer the governance role to another address.
+ 32 |     |      * @param newGovernance The new governance address
+ 33 |     |      */
+ 34 |     |     function transferGovernance(address newGovernance) external;
+ 35 |     | 
+ 36 |     |     /**
+ 37 |     |      * @notice Transfer the mint limiter role to another address.
+ 38 |     |      * @param newGovernance The new mint limiter address
+ 39 |     |      */
+ 40 |     |     function transferMintLimiter(address newGovernance) external;
+ 41 |     | }
+ 42 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IImplementation.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | import { IContractIdentifier } from './IContractIdentifier.sol';
+  6 |     | 
+  7 |     | interface IImplementation is IContractIdentifier {
+  8 |     |     error NotProxy();
+  9 |     | 
+ 10 |     |     function setup(bytes calldata data) external;
+ 11 |     | }
+ 12 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/interfaces/IOwnable.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | /**
+  6 |     |  * @title IOwnable Interface
+  7 |     |  * @notice IOwnable is an interface that abstracts the implementation of a
+  8 |     |  * contract with ownership control features. It's commonly used in upgradable
+  9 |     |  * contracts and includes the functionality to get current owner, transfer
+ 10 |     |  * ownership, and propose and accept ownership.
+ 11 |     |  */
+ 12 |     | interface IOwnable {
+ 13 |     |     error NotOwner();
+ 14 |     |     error InvalidOwner();
+ 15 |     |     error InvalidOwnerAddress();
+ 16 |     | 
+ 17 |     |     event OwnershipTransferStarted(address indexed newOwner);
+ 18 |     |     event OwnershipTransferred(address indexed newOwner);
+ 19 |     | 
+ 20 |     |     /**
+ 21 |     |      * @notice Returns the current owner of the contract.
+ 22 |     |      * @return address The address of the current owner
+ 23 |     |      */
+ 24 |     |     function owner() external view returns (address);
+ 25 |     | 
+ 26 |     |     /**
+ 27 |     |      * @notice Returns the address of the pending owner of the contract.
+ 28 |     |      * @return address The address of the pending owner
+ 29 |     |      */
+ 30 |     |     function pendingOwner() external view returns (address);
+ 31 |     | 
+ 32 |     |     /**
+ 33 |     |      * @notice Transfers ownership of the contract to a new address
+ 34 |     |      * @param newOwner The address to transfer ownership to
+ 35 |     |      */
+ 36 |     |     function transferOwnership(address newOwner) external;
+ 37 |     | 
+ 38 |     |     /**
+ 39 |     |      * @notice Proposes to transfer the contract's ownership to a new address.
+ 40 |     |      * The new owner needs to accept the ownership explicitly.
+ 41 |     |      * @param newOwner The address to transfer ownership to
+ 42 |     |      */
+ 43 |     |     function proposeOwnership(address newOwner) external;
+ 44 |     | 
+ 45 |     |     /**
+ 46 |     |      * @notice Transfers ownership to the pending owner.
+ 47 |     |      * @dev Can only be called by the pending owner
+ 48 |     |      */
+ 49 |     |     function acceptOwnership() external;
+ 50 |     | }
+ 51 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/libs/ContractAddress.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | library ContractAddress {
+  6 | *   |     function isContract(address contractAddress) internal view returns (bool) {
+  7 |     |         bytes32 existingCodeHash = contractAddress.codehash;
+  8 |     | 
+  9 |     |         // https://eips.ethereum.org/EIPS/eip-1052
+ 10 |     |         // keccak256('') == 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+ 11 | *   |         return
+ 12 | *   |             existingCodeHash != bytes32(0) &&
+ 13 |     |             existingCodeHash != 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;
+ 14 |     |     }
+ 15 |     | }
+ 16 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/libs/SafeTransfer.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | import { IERC20 } from '../interfaces/IERC20.sol';
+  6 |     | 
+  7 |     | error TokenTransferFailed();
+  8 |     | 
+  9 |     | /*
+ 10 |     |  * @title SafeTokenCall
+ 11 |     |  * @dev This library is used for performing safe token transfers.
+ 12 |     |  */
+ 13 |     | library SafeTokenCall {
+ 14 |     |     /*
+ 15 |     |      * @notice Make a safe call to a token contract.
+ 16 |     |      * @param token The token contract to interact with.
+ 17 |     |      * @param callData The function call data.
+ 18 |     |      * @throws TokenTransferFailed error if transfer of token is not successful.
+ 19 |     |      */
+ 20 |     |     function safeCall(IERC20 token, bytes memory callData) internal {
+ 21 |     |         (bool success, bytes memory returnData) = address(token).call(callData);
+ 22 |     |         bool transferred = success && (returnData.length == uint256(0) || abi.decode(returnData, (bool)));
+ 23 |     | 
+ 24 |     |         if (!transferred || address(token).code.length == 0) revert TokenTransferFailed();
+ 25 |     |     }
+ 26 |     | }
+ 27 |     | 
+ 28 |     | /*
+ 29 |     |  * @title SafeTokenTransfer
+ 30 |     |  * @dev This library safely transfers tokens from the contract to a recipient.
+ 31 |     |  */
+ 32 |     | library SafeTokenTransfer {
+ 33 |     |     /*
+ 34 |     |      * @notice Transfer tokens to a recipient.
+ 35 |     |      * @param token The token contract.
+ 36 |     |      * @param receiver The recipient of the tokens.
+ 37 |     |      * @param amount The amount of tokens to transfer.
+ 38 |     |      */
+ 39 |     |     function safeTransfer(
+ 40 |     |         IERC20 token,
+ 41 |     |         address receiver,
+ 42 |     |         uint256 amount
+ 43 |     |     ) internal {
+ 44 |     |         SafeTokenCall.safeCall(token, abi.encodeWithSelector(IERC20.transfer.selector, receiver, amount));
+ 45 |     |     }
+ 46 |     | }
+ 47 |     | 
+ 48 |     | /*
+ 49 |     |  * @title SafeTokenTransferFrom
+ 50 |     |  * @dev This library helps to safely transfer tokens on behalf of a token holder.
+ 51 |     |  */
+ 52 |     | library SafeTokenTransferFrom {
+ 53 |     |     /*
+ 54 |     |      * @notice Transfer tokens on behalf of a token holder.
+ 55 |     |      * @param token The token contract.
+ 56 |     |      * @param from The address of the token holder.
+ 57 |     |      * @param to The address the tokens are to be sent to.
+ 58 |     |      * @param amount The amount of tokens to be transferred.
+ 59 |     |      */
+ 60 |     |     function safeTransferFrom(
+ 61 |     |         IERC20 token,
+ 62 |     |         address from,
+ 63 |     |         address to,
+ 64 |     |         uint256 amount
+ 65 |     |     ) internal {
+ 66 |     |         SafeTokenCall.safeCall(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+ 67 |     |     }
+ 68 |     | }
+ 69 |     | 
+
+/workspace/node_modules/@axelar-network/axelar-gmp-sdk-solidity/contracts/upgradable/Implementation.sol
+  1 |     | // SPDX-License-Identifier: MIT
+  2 |     | 
+  3 |     | pragma solidity ^0.8.0;
+  4 |     | 
+  5 |     | import { IImplementation } from '../interfaces/IImplementation.sol';
+  6 |     | 
+  7 |     | /**
+  8 |     |  * @title Implementation
+  9 |     |  * @notice This contract serves as a base for other contracts and enforces a proxy-first access restriction.
+ 10 |     |  * @dev Derived contracts must implement the setup function.
+ 11 |     |  */
+ 12 |     | abstract contract Implementation is IImplementation {
+ 13 |     |     address private immutable implementationAddress;
+ 14 |     | 
+ 15 |     |     /**
+ 16 |     |      * @dev Contract constructor that sets the implementation address to the address of this contract.
+ 17 |     |      */
+ 18 |     |     constructor() {
+ 19 | *   |         implementationAddress = address(this);
+ 20 |     |     }
+ 21 |     | 
+ 22 |     |     /**
+ 23 |     |      * @dev Modifier to require the caller to be the proxy contract.
+ 24 |     |      * Reverts if the caller is the current contract (i.e., the implementation contract itself).
+ 25 |     |      */
+ 26 |     |     modifier onlyProxy() {
+ 27 |     |         if (implementationAddress == address(this)) revert NotProxy();
+ 28 |     |         _;
+ 29 |     |     }
+ 30 |     | 
+ 31 |     |     /**
+ 32 |     |      * @notice Initializes contract parameters.
+ 33 |     |      * This function is intended to be overridden by derived contracts.
+ 34 |     |      * The overriding function must have the onlyProxy modifier.
+ 35 |     |      * @param params The parameters to be used for initialization
+ 36 |     |      */
+ 37 |     |     function setup(bytes calldata params) external virtual;
+ 38 |     | }
+ 39 |     | 
+
